@@ -1,0 +1,18 @@
+## Interface: 16001
+## Title: WritRunner
+## Notes: Cheapest-path Craftsman's Writ reputation planner for WoW: Forever, using Auctionator prices, with a run tracker, map pins, and bag check.
+## Author: Darth
+## Version: 1.2.0
+## OptionalDeps: Auctionator, TomTom
+## SavedVariables: WritRunnerDB
+
+Data.lua
+WritRunner.lua
+Pricing.lua
+Daily.lua
+Route.lua
+Run.lua
+Rep.lua
+Pins.lua
+Tracker.lua
+UI.lua
