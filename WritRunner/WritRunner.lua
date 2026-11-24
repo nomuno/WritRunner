@@ -127,13 +127,11 @@ events:SetScript("OnEvent", function(_, event, arg1, arg2, arg3)
     end
   elseif event == "QUEST_TURNED_IN" then
     WR.RecordReward(arg1, arg3)
-    -- Run first so the step is completed as a real turn-in (starts the
-    -- timer). Daily also records it; OnDailyCompleted is then a no-op.
-    if WR.Run and WR.Run.OnQuestTurnedIn then
-      WR.Run.OnQuestTurnedIn(arg1)
-    end
     if WR.Daily then
       WR.Daily.OnQuestTurnedIn(arg1)
+    end
+    if WR.Run and WR.Run.OnQuestTurnedIn then
+      WR.Run.OnQuestTurnedIn(arg1)
     end
   end
 end)

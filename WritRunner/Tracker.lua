@@ -198,7 +198,7 @@ function Tracker.RefreshStats()
     return
   end
   local parts
-  if not run.clockStarted then
+  if run.clockStarted == false then
     parts = { "|cffffd100Timer starts at first turn-in|r" }
   else
     parts = {
