@@ -154,8 +154,9 @@ function Daily.SetCompleted(writ, done, silent, source)
   end
   WR.db.completed = WR.db.completed or {}
   local current = Daily.Source(writ)
+  local want
   if done then
-    local want = source or "turnin"
+    want = source or "turnin"
     if want ~= "manual" then
       want = "turnin"
     end
@@ -176,7 +177,7 @@ function Daily.SetCompleted(writ, done, silent, source)
     WR.UI.Refresh()
   end
   if done and WR.Run and WR.Run.OnDailyCompleted then
-    WR.Run.OnDailyCompleted(writ, true)
+    WR.Run.OnDailyCompleted(writ, true, want)
   end
 end
 

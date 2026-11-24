@@ -3,7 +3,7 @@
 A World of Warcraft: Forever addon that ranks Craftsman's Writs by reputation per gold, using live Auctionator prices, then builds an auction-house shopping list and a turn-in route. A compact tracker runs the route like a quest objective list, with numbered world-map pins and a click-to-open button for the next writ only (so you do not have to fill your quest log and bags all at once).
 
 **Author:** Darth
-**Version:** 1.1.0
+**Version:** 1.2.2
 **Interface:** 16001 (Forever / game 1.60.1)
 **Optional:** Auctionator, TomTom
 

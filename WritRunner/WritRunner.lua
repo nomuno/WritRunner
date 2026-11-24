@@ -127,11 +127,13 @@ events:SetScript("OnEvent", function(_, event, arg1, arg2, arg3)
     end
   elseif event == "QUEST_TURNED_IN" then
     WR.RecordReward(arg1, arg3)
-    if WR.Daily then
-      WR.Daily.OnQuestTurnedIn(arg1)
-    end
+    -- Run first so the step is completed as a real turn-in (starts the
+    -- timer). Daily also records it; OnDailyCompleted is then a no-op.
     if WR.Run and WR.Run.OnQuestTurnedIn then
       WR.Run.OnQuestTurnedIn(arg1)
+    end
+    if WR.Daily then
+      WR.Daily.OnQuestTurnedIn(arg1)
     end
   end
 end)
@@ -141,7 +143,7 @@ SLASH_WRITRUNNER2 = "/writrunner"
 SlashCmdList.WRITRUNNER = function(msg)
   msg = (msg or ""):lower():match("^%s*(.-)%s*$")
   if msg == "help" then
-    WR.Print("Commands: /writs toggles the window. /writs start, /writs check, /writs track, /writs end, /writs minimap, /writs reset (clears today's completed writs after a confirm popup).")
+    WR.Print("Commands: /writs toggles the window. /writs start, /writs check, /writs track, /writs end, /writs minimap, /writs reroute (rebuild remaining run order), /writs reset (clears today's completed writs after a confirm popup).")
     return
   end
   if msg == "reset" then
@@ -207,6 +209,15 @@ SlashCmdList.WRITRUNNER = function(msg)
   if msg == "end" then
     if WR.Run and WR.Run.End then
       WR.Run.End()
+    end
+    return
+  end
+  if msg == "reroute" then
+    if WR.Run and WR.Run.Reroute then
+      local ok, err = WR.Run.Reroute(false)
+      if not ok and err then
+        WR.Print(err)
+      end
     end
     return
   end

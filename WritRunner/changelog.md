@@ -1,3 +1,12 @@
+# 1.2.2
+
+- Faction-aware Classic travel: routes use Horde or Alliance flight points, ground runs into zones with no own-faction FP (Horde is no longer told to "Fly to Duskwood"), and zeppelin/boat crossings with realistic times. Ordering is shortest-path (Dijkstra) plus nearest-neighbor and 2-opt on those times, so a southern Eastern Kingdoms run prefers Swamp of Sorrows → run to Duskwood → Stranglethorn, then the Grom'gol zeppelin or Booty Bay boat to Kalimdor.
+- `/writs reroute` rebuilds the remaining steps of an active run from your current position without losing progress. A `/reload` also reroutes the remaining steps.
+
+# 1.2.1
+
+- Fixed the run timer not starting on the first writ hand-in. `QUEST_TURNED_IN` was recorded by the daily-completion tracker first, which marked the step done as a "daily" update and skipped the clock. The clock now starts on the first real turn-in (quest event, bag fallback, or a daily mark that came from a turn-in), and also if you click Skip / Mark done after handing in. If a run is already past the first step with the timer still stopped, it starts at the next real turn-in.
+
 # 1.2.0
 
 Planner
