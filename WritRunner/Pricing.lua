@@ -128,6 +128,145 @@ function WR.GoldToCopper(gold)
   return n * 10000
 end
 
+-- Rewrite a PriceWrit result so an already-owned writ costs nothing to
+-- buy. The fill item still costs unless it is also already owned.
+function WR.ApplyOwnedPricing(price, writ, haveWrit, haveFill)
+  if not price or not haveWrit then
+    return price
+  end
+  price.ownedWrit = true
+  price.ownedFill = haveFill and true or false
+  price.ownedBank = price.ownedBank or false
+  price.writCopper = 0
+  if haveFill then
+    price.itemCopper = 0
+    price.totalCopper = 0
+    price.known = true
+    price.repPerGold = 1e9
+    if price.rewardCopper then
+      price.netCopper = 0 - price.rewardCopper
+    end
+  else
+    price.totalCopper = price.itemCopper
+    price.known = price.itemCopper ~= nil
+    if price.known and price.totalCopper and price.totalCopper > 0 and writ and writ.rep then
+      price.repPerGold = writ.rep / (price.totalCopper / 10000)
+    elseif price.known then
+      price.repPerGold = 1e9
+    end
+    if price.known and price.rewardCopper then
+      price.netCopper = (price.totalCopper or 0) - price.rewardCopper
+    else
+      price.netCopper = nil
+    end
+  end
+  return price
+end
+
+function WR.ExpectedPouchCopper(tier)
+  if WR.Ledger and WR.Ledger.ExpectedPouch then
+    return WR.Ledger.ExpectedPouch(tier)
+  end
+  return nil
+end
+
+-- Attach the expected Coin Pouch return and an estimated net
+-- (cost - quest gold - pouch). Does not invent a number: missing
+-- averages stay nil and the UI shows "?".
+function WR.AttachPouchEstimate(price, writ)
+  if not price or not writ then
+    return price
+  end
+  local pouch, kind, n, src = WR.ExpectedPouchCopper(writ.tier)
+  price.estPouch = pouch
+  price.estPouchKind = kind
+  price.estPouchN = n
+  price.estPouchSource = src
+  if price.known and pouch then
+    price.estNetCopper = (price.totalCopper or 0) - (price.rewardCopper or 0) - pouch
+    price.estNetKnown = true
+  else
+    price.estNetCopper = price.netCopper
+    price.estNetKnown = false
+  end
+  return price
+end
+
+local function WritIndex()
+  local index = {}
+  local writs = WritRunnerData and WritRunnerData.writs or {}
+  local i
+  for i = 1, #writs do
+    local w = writs[i]
+    if w.writItemId then
+      index[w.writItemId] = w
+    end
+  end
+  return index
+end
+
+-- Scan bags (and the bank, cheaply) for named writs the player already
+-- owns. Routable ones are returned in `owned`; others in `skipped` with
+-- a reason. Completed-today writs are ignored.
+function WR.CollectBagWrits()
+  local owned, skipped = {}, {}
+  local index = WritIndex()
+  local itemId, writ
+  for itemId, writ in pairs(index) do
+    if not (WR.Daily and WR.Daily.IsCompleted and WR.Daily.IsCompleted(writ)) then
+      local bags, bank, total = 0, 0, 0
+      if WR.GetOwnedCount then
+        bags, bank, total = WR.GetOwnedCount(itemId)
+      else
+        bags = WR.GetBagCount and WR.GetBagCount(itemId) or 0
+        total = bags
+      end
+      if total > 0 then
+        local fillBags, fillBank, fillTotal = 0, 0, 0
+        if writ.requiredItemId then
+          if WR.GetOwnedCount then
+            fillBags, fillBank, fillTotal = WR.GetOwnedCount(writ.requiredItemId)
+            local need = writ.requiredCount or 1
+            -- "Already in bags" means the bags themselves cover the fill.
+            -- Bank counts as owned for shopping (withdraw first) but the
+            -- shop list still lists it if only the bank has it? User asked
+            -- for bags; bank is treated as owned so we don't re-buy it.
+            fillBags = fillTotal >= need
+          else
+            fillBags = (WR.GetBagCount and WR.GetBagCount(writ.requiredItemId) or 0) >= (writ.requiredCount or 1)
+          end
+        end
+        local ok, reason = true, nil
+        if WR.Route and WR.Route.IsRoutable then
+          ok, reason = WR.Route.IsRoutable(writ)
+        elseif not (writ.zone and writ.npc and writ.coords) then
+          ok, reason = false, "no turn-in location"
+        end
+        local rec = {
+          writ = writ,
+          bags = bags,
+          bank = bank,
+          haveFill = fillBags and true or false,
+          inBank = bags <= 0 and bank > 0,
+        }
+        if ok then
+          owned[#owned + 1] = rec
+        else
+          rec.reason = reason or "no known path to the NPC"
+          skipped[#skipped + 1] = rec
+        end
+      end
+    end
+  end
+  table.sort(owned, function(a, b)
+    return (a.writ.writItemName or "") < (b.writ.writItemName or "")
+  end)
+  table.sort(skipped, function(a, b)
+    return (a.writ.writItemName or "") < (b.writ.writItemName or "")
+  end)
+  return owned, skipped
+end
+
 -- Rank writs: known prices first by rep-per-gold descending, unknowns last.
 -- Applies filters and excludes completed writs when requested.
 function WR.RankWrits(opts)
@@ -145,19 +284,64 @@ function WR.RankWrits(opts)
     elseif hideUnconfirmed and not WR.Confirmed(w) then
       -- skip
     else
-      local price = WR.PriceWrit(w)
+      local price = WR.AttachPouchEstimate(WR.PriceWrit(w), w)
       local overMax = maxCopper and price.known and price.totalCopper > maxCopper
       if not overMax then
         rows[#rows + 1] = { writ = w, price = price }
       end
     end
   end
+  -- Owned bag writs: always listed when the option is on (even if they
+  -- were hidden as unconfirmed or over Max per writ). Writ cost is 0.
+  if opts.useBagWrits then
+    local owned = opts.bagOwned
+    if not owned then
+      owned = select(1, WR.CollectBagWrits())
+    end
+    local have = {}
+    local r
+    for r = 1, #rows do
+      local id = rows[r].writ and rows[r].writ.questId
+      if id then
+        have[id] = rows[r]
+      end
+    end
+    local i
+    for i = 1, #(owned or {}) do
+      local rec = owned[i]
+      local w = rec.writ
+      local row = w.questId and have[w.questId]
+      if row then
+        WR.ApplyOwnedPricing(row.price, w, true, rec.haveFill)
+        WR.AttachPouchEstimate(row.price, w)
+        row.price.ownedBank = rec.inBank and true or false
+      else
+        local price = WR.ApplyOwnedPricing(WR.PriceWrit(w), w, true, rec.haveFill)
+        WR.AttachPouchEstimate(price, w)
+        price.ownedBank = rec.inBank and true or false
+        rows[#rows + 1] = { writ = w, price = price }
+      end
+    end
+  end
+  local function Rpg(row)
+    if opts.rankByNet and row.price.estNetKnown and row.writ and row.writ.rep then
+      local net = row.price.estNetCopper or 0
+      if net <= 0 then
+        return 1e9
+      end
+      return row.writ.rep / (net / 10000)
+    end
+    return row.price.repPerGold or 0
+  end
   table.sort(rows, function(a, b)
     if a.price.known and b.price.known then
-      if a.price.repPerGold ~= b.price.repPerGold then
-        return a.price.repPerGold > b.price.repPerGold
+      local ra, rb = Rpg(a), Rpg(b)
+      if ra ~= rb then
+        return ra > rb
       end
-      return a.price.totalCopper < b.price.totalCopper
+      local na = (opts.rankByNet and a.price.estNetKnown) and (a.price.estNetCopper or 0) or a.price.totalCopper
+      local nb = (opts.rankByNet and b.price.estNetKnown) and (b.price.estNetCopper or 0) or b.price.totalCopper
+      return (na or 0) < (nb or 0)
     end
     if a.price.known ~= b.price.known then
       return a.price.known
@@ -173,12 +357,25 @@ function WR.PickWithinBudget(ranked, budgetCopper)
   local picked = {}
   local spent = 0
   local i
+  -- Owned writs always come first and always fit (writ is free; only a
+  -- missing fill item may add cost, and even then we keep the writ).
   for i = 1, #ranked do
     local row = ranked[i]
-    if row.price.known then
-      if not budgetCopper or (spent + row.price.totalCopper) <= budgetCopper then
-        picked[#picked + 1] = row
-        spent = spent + row.price.totalCopper
+    if row.price and row.price.ownedWrit then
+      picked[#picked + 1] = row
+      if row.price.known then
+        spent = spent + (row.price.totalCopper or 0)
+      end
+    end
+  end
+  for i = 1, #ranked do
+    local row = ranked[i]
+    if not (row.price and row.price.ownedWrit) then
+      if row.price.known then
+        if not budgetCopper or (spent + row.price.totalCopper) <= budgetCopper then
+          picked[#picked + 1] = row
+          spent = spent + row.price.totalCopper
+        end
       end
     end
   end
@@ -213,7 +410,9 @@ function WR.TryAuctionatorShopping(terms, listName)
   -- Confirmed current fallback: MultiSearch / MultiSearchExact require the AH
   -- to be open. Prefer exact name matches so "Mana Potion" does not fuzzy-hit
   -- Lesser Mana Potion.
-  local ahOpen = AuctionHouseFrame and AuctionHouseFrame:IsShown()
+  local ahOpen = (WR.Buyer and WR.Buyer.IsAHOpen and WR.Buyer.IsAHOpen())
+    or (AuctionFrame and AuctionFrame.IsShown and AuctionFrame:IsShown())
+    or (AuctionHouseFrame and AuctionHouseFrame.IsShown and AuctionHouseFrame:IsShown())
   if not ahOpen then
     return false, "Open the Auction House first. CreateShoppingList is not available in this Auctionator build, so WritRunner uses MultiSearch instead."
   end

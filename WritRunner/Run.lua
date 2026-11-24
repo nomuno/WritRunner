@@ -8,23 +8,223 @@ local function Now()
   return (GetServerTime and GetServerTime()) or time()
 end
 
-function WR.GetBagCount(itemId)
+function WR.GetItemCount(itemId, includeBank)
   if not itemId then
     return 0
   end
+  includeBank = includeBank and true or false
   if C_Item and C_Item.GetItemCount then
-    local ok, n = pcall(C_Item.GetItemCount, itemId, false)
+    local ok, n = pcall(C_Item.GetItemCount, itemId, includeBank)
     if ok and type(n) == "number" then
       return n
     end
   end
   if GetItemCount then
-    local ok, n = pcall(GetItemCount, itemId, false)
+    local ok, n = pcall(GetItemCount, itemId, includeBank)
     if ok and type(n) == "number" then
       return n
     end
   end
   return 0
+end
+
+function WR.GetBagCount(itemId)
+  return WR.GetItemCount(itemId, false)
+end
+
+-- bags first, then any extra sitting in the bank (cheap: one GetItemCount).
+function WR.GetOwnedCount(itemId)
+  local bags = WR.GetItemCount(itemId, false)
+  local all = WR.GetItemCount(itemId, true)
+  if all < bags then
+    all = bags
+  end
+  return bags, all - bags, all
+end
+
+------------------------------------------------------------------------
+-- Mailbox cache: only scanned while the mailbox UI is open, so an empty
+-- GetInboxNumItems when it is closed cannot wipe what we last saw.
+-- Counts are keyed by item id and stamped with the time last seen.
+-- Today's buy log fills in purchases that have not been collected yet
+-- and are not already in the cache, bags, or bank.
+------------------------------------------------------------------------
+
+local function MailboxOpen()
+  if MailFrame and MailFrame.IsShown and MailFrame:IsShown() then
+    return true
+  end
+  if InboxFrame and InboxFrame.IsShown and InboxFrame:IsShown() then
+    return true
+  end
+  return false
+end
+
+local function BankOpen()
+  if BankFrame and BankFrame.IsShown and BankFrame:IsShown() then
+    return true
+  end
+  return false
+end
+
+local function BoughtToday(itemId)
+  if WR.Ledger and WR.Ledger.Log then
+    local lg = WR.Ledger.Log()
+    if lg and lg.bought then
+      return lg.bought[itemId] or 0
+    end
+  end
+  if WR.Buyer and WR.Buyer.Bought then
+    return WR.Buyer.Bought(itemId) or 0
+  end
+  return 0
+end
+
+function Run.ScanMailbox()
+  if not GetInboxNumItems then
+    return nil
+  end
+  if not MailboxOpen() then
+    return nil
+  end
+  local n = GetInboxNumItems() or 0
+  local counts = {}
+  local maxAttach = ATTACHMENTS_MAX_RECEIVE or 16
+  local i, a
+  for i = 1, n do
+    for a = 1, maxAttach do
+      local id, count
+      if GetInboxItemLink then
+        local ok, link = pcall(GetInboxItemLink, i, a)
+        if ok and type(link) == "string" then
+          id = tonumber(string.match(link, "item:(%d+)"))
+        end
+      end
+      if GetInboxItem then
+        -- Retail returns 6 values (name, itemID, texture, count, quality, canUse);
+        -- classic returns 5 (name, texture, count, quality, canUse).
+        local ok, r1, r2, r3, r4, r5, r6 = pcall(GetInboxItem, i, a)
+        if ok then
+          if r6 ~= nil then
+            count = r4
+            if not id and type(r2) == "number" then
+              id = r2
+            end
+          else
+            count = r3
+          end
+        end
+      end
+      if id then
+        if not count or count < 1 then
+          count = 1
+        end
+        counts[id] = (counts[id] or 0) + count
+      end
+    end
+  end
+  if WR.db then
+    WR.db.mailCache = { at = Now(), counts = counts }
+  end
+  return counts
+end
+
+-- Returns total mail estimate, cached inbox count, pending from today's
+-- buy log, and the time the inbox was last scanned.
+function WR.GetMailCount(itemId)
+  if not itemId then
+    return 0, 0, 0, nil
+  end
+  local cache = WR.db and WR.db.mailCache
+  local cached = 0
+  local seen = cache and cache.at
+  if cache and type(cache.counts) == "table" then
+    cached = cache.counts[itemId] or 0
+  end
+  local bags, bank = 0, 0
+  if WR.GetOwnedCount then
+    bags, bank = WR.GetOwnedCount(itemId)
+  else
+    bags = WR.GetBagCount and WR.GetBagCount(itemId) or 0
+  end
+  local bought = BoughtToday(itemId)
+  local pending = bought - bags - bank - cached
+  if pending < 0 then
+    pending = 0
+  end
+  return cached + pending, cached, pending, seen
+end
+
+function WR.ItemLocations(itemId)
+  local bags, bank = 0, 0
+  if WR.GetOwnedCount then
+    bags, bank = WR.GetOwnedCount(itemId)
+  else
+    bags = WR.GetBagCount and WR.GetBagCount(itemId) or 0
+  end
+  local mail, mailCached, mailPending, seen = WR.GetMailCount(itemId)
+  return {
+    bags = bags,
+    bank = bank,
+    mail = mail,
+    mailCached = mailCached,
+    mailPending = mailPending,
+    seen = seen,
+  }
+end
+
+local function FormatSeen(at)
+  if not at then
+    return nil
+  end
+  local ok, text = pcall(date, "%I:%M %p", at)
+  if ok and type(text) == "string" then
+    text = text:gsub("^0", "")
+    return text
+  end
+  return nil
+end
+
+-- Long phrase for the popup: "in bank 1, in mailbox 2 (seen 3:10 PM)" or "not owned".
+function WR.LocationPhrase(loc)
+  loc = loc or {}
+  local bank, mail = loc.bank or 0, loc.mail or 0
+  if bank <= 0 and mail <= 0 then
+    return "not owned"
+  end
+  local parts = {}
+  if bank > 0 then
+    parts[#parts + 1] = "in bank " .. bank
+  end
+  if mail > 0 then
+    local bit = "in mailbox " .. mail
+    if (loc.mailPending or 0) > 0 and (loc.mailCached or 0) == 0 then
+      bit = bit .. " (from today's purchases)"
+    elseif loc.seen then
+      local when = FormatSeen(loc.seen)
+      if when then
+        bit = bit .. " (seen " .. when .. ")"
+      end
+    end
+    parts[#parts + 1] = bit
+  end
+  return table.concat(parts, ", ")
+end
+
+-- Compact tags for #4: "bank 1, mail 1" or nil if neither.
+function WR.LocationTag(loc)
+  loc = loc or {}
+  local parts = {}
+  if (loc.bank or 0) > 0 then
+    parts[#parts + 1] = "bank " .. loc.bank
+  end
+  if (loc.mail or 0) > 0 then
+    parts[#parts + 1] = "mail " .. loc.mail
+  end
+  if #parts == 0 then
+    return nil
+  end
+  return table.concat(parts, ", ")
 end
 
 local function DB()
@@ -272,8 +472,18 @@ function Run.CheckBags(source)
   local missing = {}
   for i = 1, #items do
     local rec = items[i]
-    rec.have = WR.GetBagCount(rec.itemId)
+    local loc = WR.ItemLocations(rec.itemId)
+    rec.have = loc.bags or 0
+    rec.bags = loc.bags or 0
+    rec.bank = loc.bank or 0
+    rec.mail = loc.mail or 0
+    rec.mailCached = loc.mailCached or 0
+    rec.mailPending = loc.mailPending or 0
+    rec.seen = loc.seen
+    rec.where = WR.LocationPhrase(loc)
+    rec.tag = WR.LocationTag(loc)
     rec.label = ItemLabel(rec.itemId, rec.name)
+    -- Start run and Check bags only count what is in bags, not bank or mail.
     if rec.have < rec.need then
       missing[#missing + 1] = rec
     end
@@ -305,27 +515,38 @@ local function FormatMissingLines(report)
     if rec.writList and #rec.writList > 0 then
       forWrit = "  (" .. table.concat(rec.writList, ", ") .. ")"
     end
-    lines[#lines + 1] = string.format("%s  |cffff8080%d/%d|r%s", rec.label or "item", rec.have or 0, rec.need or 1, forWrit)
+    local where = rec.where or "not owned"
+    lines[#lines + 1] = string.format("%s  |cffff8080%d/%d|r  %s%s", rec.label or "item", rec.have or 0, rec.need or 1, where, forWrit)
   end
   return lines
 end
 
-local function PlaceButtons(one, two)
+-- buttons is a list of { text = "...", onClick = fn }.
+local function PlaceButtons(buttons)
   local dlg = bagDlg
-  dlg.btn1:ClearAllPoints()
-  dlg.btn2:ClearAllPoints()
-  if two then
-    dlg.btn1:SetText(one)
-    dlg.btn2:SetText(two)
-    dlg.btn1:SetPoint("BOTTOM", dlg, "BOTTOM", -70, 14)
-    dlg.btn2:SetPoint("BOTTOM", dlg, "BOTTOM", 70, 14)
-    dlg.btn1:Show()
-    dlg.btn2:Show()
-  else
-    dlg.btn1:SetText(one)
-    dlg.btn1:SetPoint("BOTTOM", dlg, "BOTTOM", 0, 14)
-    dlg.btn1:Show()
-    dlg.btn2:Hide()
+  if not dlg.btn3 then
+    local btn = CreateFrame("Button", nil, dlg, "UIPanelButtonTemplate")
+    btn:SetSize(120, 22)
+    dlg.btn3 = btn
+  end
+  local slots = { dlg.btn1, dlg.btn2, dlg.btn3 }
+  local i
+  for i = 1, #slots do
+    slots[i]:Hide()
+    slots[i]:SetScript("OnClick", nil)
+    slots[i]:ClearAllPoints()
+  end
+  local n = #buttons
+  local width = n >= 3 and 118 or 120
+  local gap = n >= 3 and 126 or 140
+  local start = -((n - 1) * gap) / 2
+  for i = 1, n do
+    local b = slots[i]
+    b:SetWidth(width)
+    b:SetText(buttons[i].text)
+    b:SetScript("OnClick", buttons[i].onClick)
+    b:SetPoint("BOTTOM", dlg, "BOTTOM", start + (i - 1) * gap, 14)
+    b:Show()
   end
 end
 
@@ -353,6 +574,45 @@ end
 local function CancelPendingStart()
   pendingStart = nil
   HideBagDialog()
+end
+
+local lastBagSource, lastBagMode
+
+local function RecheckBags()
+  local source = lastBagSource
+  local mode = lastBagMode or "check"
+  if not source then
+    return
+  end
+  local report = Run.CheckBags(source)
+  if bagDlg then
+    bagDlg.keepPending = true
+  end
+  Run.ShowBagReport(report, mode, pendingStart or source)
+end
+
+local function MissingHint(report)
+  local hasBank, hasMail = false, false
+  local i
+  for i = 1, #(report.missing or {}) do
+    local rec = report.missing[i]
+    if (rec.bank or 0) > 0 then
+      hasBank = true
+    end
+    if (rec.mail or 0) > 0 then
+      hasMail = true
+    end
+  end
+  if hasBank and hasMail then
+    return "Visit the bank or mailbox, then Start run again."
+  end
+  if hasBank then
+    return "Visit the bank, then Start run again."
+  end
+  if hasMail then
+    return "Visit the mailbox, then Start run again."
+  end
+  return "Get the missing items into your bags, then Start run again."
 end
 
 local function EnsureBagDialog()
@@ -450,7 +710,7 @@ local function EnsureBagDialog()
   footer:SetPoint("BOTTOMLEFT", 20, 44)
   footer:SetPoint("BOTTOMRIGHT", -20, 44)
   footer:SetJustifyH("LEFT")
-  footer:SetText("Items still in the mailbox do not count — take them out first.")
+  footer:SetText("Start run counts bags only. Items in the bank or mailbox do not count until you take them out.")
   dlg.footer = footer
 
   local function MakeBtn()
@@ -460,19 +720,14 @@ local function EnsureBagDialog()
   end
   dlg.btn1 = MakeBtn()
   dlg.btn2 = MakeBtn()
-  dlg.btn1:SetScript("OnClick", function()
-    if dlg.mode == "startMissing" then
-      AcceptStartAnyway()
-    else
-      CancelPendingStart()
-    end
-  end)
-  dlg.btn2:SetScript("OnClick", function()
-    CancelPendingStart()
-  end)
+  dlg.btn3 = MakeBtn()
 
   dlg:SetScript("OnHide", function()
     -- ESC / close: drop a pending start so a later Start anyway cannot fire stale.
+    if dlg.keepPending then
+      dlg.keepPending = nil
+      return
+    end
     pendingStart = nil
   end)
   dlg:SetScript("OnMouseWheel", function() end)
@@ -529,45 +784,83 @@ local function LayoutList(dlg, title, header, lines)
   dlg.scroll:SetVerticalScroll(0)
 end
 
--- mode is "check" (OK only) or "start" (Start anyway / Cancel when items are missing).
-function Run.ShowBagReport(report, mode, picked)
+-- mode is "check" or "start". Start run requires bags; missing items do
+-- not start the tracker unless "Allow starting with missing items" is on.
+function Run.ShowBagReport(report, mode, picked, source)
   if not report then
     return
   end
   mode = mode or "check"
+  lastBagMode = mode
+  lastBagSource = source or picked or lastBagSource
   local dlg = EnsureBagDialog()
-  -- Clear first so a previous OnHide does not wipe a new pending start.
+  -- Keep a pending start across a refresh (Check again).
+  local keep = pendingStart
   if dlg:IsShown() then
-    pendingStart = nil
+    dlg.keepPending = true
     dlg:Hide()
   end
+  pendingStart = keep
+  local allow = WR.db and WR.db.allowStartMissing and true or false
   if mode == "start" and report.missingCount and report.missingCount > 0 then
-    pendingStart = picked
+    pendingStart = picked or source or pendingStart
     dlg.mode = "startMissing"
     local lines = FormatMissingLines(report)
     LayoutList(dlg, "Missing items",
-      string.format("|cffff4040Missing %d item%s for this run:|r",
+      string.format("|cffff4040Missing %d item%s in your bags:|r",
         report.missingCount, report.missingCount == 1 and "" or "s"),
       lines)
-    PlaceButtons("Start anyway", "Cancel")
+    dlg.footer:SetText(MissingHint(report))
+    local buttons = {
+      { text = "Check again", onClick = RecheckBags },
+      { text = "Close", onClick = CancelPendingStart },
+    }
+    if allow then
+      buttons = {
+        { text = "Check again", onClick = RecheckBags },
+        { text = "Start anyway", onClick = AcceptStartAnyway },
+        { text = "Close", onClick = CancelPendingStart },
+      }
+    end
+    PlaceButtons(buttons)
+  elseif mode == "start" and (not report.missingCount or report.missingCount == 0)
+      and not report.empty and not report.allDone then
+    -- Recheck found everything: offer to start, do not auto-start.
+    pendingStart = picked or source or pendingStart
+    dlg.mode = "startReady"
+    LayoutMessage(dlg, "WritRunner",
+      string.format("|cff40ff40All %d items are in your bags. Good to go.|r", report.checkedCount or 0))
+    PlaceButtons({
+      { text = "Start run", onClick = AcceptStartAnyway },
+      { text = "Close", onClick = CancelPendingStart },
+    })
   else
-    pendingStart = nil
+    if mode ~= "start" then
+      pendingStart = nil
+    end
     dlg.mode = "check"
     if report.empty then
       LayoutMessage(dlg, "WritRunner", "Nothing to check. Set a budget so the plan has writs, then try again.")
+      PlaceButtons({ { text = "OK", onClick = CancelPendingStart } })
     elseif report.allDone or report.checkedCount == 0 then
       LayoutMessage(dlg, "WritRunner", "Nothing left to check: every writ in the plan is already done today.")
+      PlaceButtons({ { text = "OK", onClick = CancelPendingStart } })
     elseif report.missingCount and report.missingCount > 0 then
       local lines = FormatMissingLines(report)
       LayoutList(dlg, "Missing items",
-        string.format("|cffff4040Missing %d item%s for this run:|r",
+        string.format("|cffff4040Missing %d item%s in your bags:|r",
           report.missingCount, report.missingCount == 1 and "" or "s"),
         lines)
+      dlg.footer:SetText(MissingHint(report))
+      PlaceButtons({
+        { text = "Check again", onClick = RecheckBags },
+        { text = "Close", onClick = CancelPendingStart },
+      })
     else
       LayoutMessage(dlg, "WritRunner",
         string.format("|cff40ff40All %d items are in your bags. Good to go.|r", report.checkedCount or 0))
+      PlaceButtons({ { text = "OK", onClick = CancelPendingStart } })
     end
-    PlaceButtons("OK")
   end
   dlg:Show()
   if dlg.Raise then
@@ -611,7 +904,15 @@ function Run.Start(picked)
     splitElapsed = 0,
     splitDist = 0,
     repAtStart = WR.Rep and WR.Rep.Value and WR.Rep.Value() or nil,
+    plannedCost = 0,
+    actualSpent = 0,
+    pouchGold = 0,
+    pouchOpened = 0,
+    questGold = 0,
   }
+  if WR.Ledger and WR.Ledger.OnRunStart then
+    WR.Ledger.OnRunStart(picked)
+  end
   RefreshWatch()
   if WR.Tracker and WR.Tracker.Show then
     WR.Tracker.Show()
@@ -632,11 +933,14 @@ function Run.Start(picked)
   return true
 end
 
-function Run.End(reason)
+-- Finish a run: save history, show the summary (unless silent / daily
+-- reset), then clear. End() is the player-facing entry: it warns first
+-- when Coin Pouches are still unopened.
+function Run.Finish(reason)
   local db = DB()
   if not db or not db.run or not db.run.active then
     if db then
-      db.run = nil
+      db.run = { active = false, trackerShown = false }
     end
     if WR.Tracker and WR.Tracker.Hide then
       WR.Tracker.Hide()
@@ -649,10 +953,13 @@ function Run.End(reason)
     end
     return
   end
+  if WR.Ledger and WR.Ledger.FinishRun then
+    WR.Ledger.FinishRun(reason)
+  end
   db.run.active = false
   db.run.watch = nil
-  -- Keep steps around until the next start so the user can glance back?
-  -- Clear fully so /reload does not restore a finished run.
+  -- Clear fully so /reload does not restore a finished run. History lives
+  -- in WritRunnerDB.runHistory.
   db.run = { active = false, trackerShown = false }
   if WR.Tracker and WR.Tracker.Hide then
     WR.Tracker.Hide()
@@ -668,6 +975,19 @@ function Run.End(reason)
   elseif reason ~= "silent" then
     WR.Print("Ended the writ run.")
   end
+end
+
+function Run.End(reason)
+  local db = DB()
+  if not db or not db.run or not db.run.active then
+    return Run.Finish(reason)
+  end
+  if reason ~= "daily reset" and reason ~= "silent" then
+    if WR.Ledger and WR.Ledger.ConfirmEnd and WR.Ledger.ConfirmEnd(reason) then
+      return
+    end
+  end
+  return Run.Finish(reason)
 end
 
 function Run.Restore()
@@ -772,6 +1092,9 @@ local function CompleteStep(index, how, dailySource)
     local secs = math.floor(run.elapsed or 0)
     WR.Print(string.format("Step %d/%d done. Run complete — all %d turn-ins finished in %d:%02d, %d yards traveled.",
       index, total, total, math.floor(secs / 60), secs % 60, math.floor((run.distance or 0) + 0.5)))
+    if WR.Ledger and WR.Ledger.OnRunComplete then
+      WR.Ledger.OnRunComplete()
+    end
   else
     local hint = nextStep.travel and (" " .. nextStep.travel .. ".") or ""
     WR.Print(string.format("Step %d/%d done. Next: %s, %s.%s", index, total, nextStep.zone or "?", nextStep.npc or "unknown NPC", hint))
@@ -1011,5 +1334,115 @@ ticker:SetScript("OnUpdate", function(_, dt)
   end
   if WR.Tracker and WR.Tracker.RefreshStats then
     WR.Tracker.RefreshStats()
+  end
+end)
+
+
+------------------------------------------------------------------------
+-- Mail cache and a one-line hint when the bank or mailbox is open and
+-- a plan item is sitting there. Own frame + events only; no secure hooks.
+------------------------------------------------------------------------
+
+local function PlanNeed()
+  local need = {}
+  local source
+  if Run.IsActive and Run.IsActive() and Run.Steps then
+    source = Run.Steps()
+  elseif WR.UI and WR.UI.GetPicked then
+    source = WR.UI.GetPicked()
+  end
+  if type(source) ~= "table" then
+    return need
+  end
+  local i
+  for i = 1, #source do
+    local entry = source[i]
+    local w = entry
+    if type(entry) == "table" and entry.writ then
+      w = entry.writ
+    end
+    if type(w) == "table" then
+      if w.writItemId then
+        need[w.writItemId] = (need[w.writItemId] or 0) + 1
+      end
+      if w.requiredItemId then
+        need[w.requiredItemId] = (need[w.requiredItemId] or 0) + (w.requiredCount or 1)
+      end
+    end
+  end
+  return need
+end
+
+local lastHintAt, lastHintKey = 0, nil
+
+local function HintPlanItems(place)
+  local need = PlanNeed()
+  local names, n, id = {}, 0
+  for id in pairs(need) do
+    local loc = WR.ItemLocations(id)
+    local short = (loc.bags or 0) < (need[id] or 1)
+    local there = 0
+    if place == "mailbox" then
+      there = loc.mail or 0
+    else
+      there = loc.bank or 0
+    end
+    if short and there > 0 then
+      n = n + 1
+      if #names < 3 then
+        names[#names + 1] = ItemLabel(id)
+      end
+    end
+  end
+  if n == 0 then
+    return
+  end
+  local key = place .. ":" .. n
+  local now = Now()
+  if lastHintKey == key and (now - lastHintAt) < 2 then
+    return
+  end
+  lastHintKey, lastHintAt = key, now
+  local list = table.concat(names, ", ")
+  if n > 3 then
+    list = list .. ", +" .. (n - 3) .. " more"
+  end
+  local verb = n == 1 and "is" or "are"
+  WR.Print(string.format("%d plan item%s %s in the %s (%s). Take %s out, then Start run.",
+    n, n == 1 and "" or "s", verb, place, list, n == 1 and "it" or "them"))
+end
+
+local locEv = CreateFrame("Frame")
+local LOC_EVENTS = {
+  "MAIL_SHOW", "MAIL_INBOX_UPDATE", "MAIL_CLOSED",
+  "BANKFRAME_OPENED", "BANKFRAME_CLOSED",
+  "PLAYER_INTERACTION_MANAGER_FRAME_SHOW",
+}
+local ei
+for ei = 1, #LOC_EVENTS do
+  pcall(locEv.RegisterEvent, locEv, LOC_EVENTS[ei])
+end
+locEv:SetScript("OnEvent", function(_, event, a1)
+  if event == "MAIL_SHOW" or event == "MAIL_INBOX_UPDATE" then
+    Run.ScanMailbox()
+    if event == "MAIL_SHOW" then
+      HintPlanItems("mailbox")
+    end
+    return
+  end
+  if event == "BANKFRAME_OPENED" then
+    HintPlanItems("bank")
+    return
+  end
+  if event == "PLAYER_INTERACTION_MANAGER_FRAME_SHOW" then
+    local t = Enum and Enum.PlayerInteractionType
+    if t then
+      if a1 == t.MailInfo or (t.Mailbox and a1 == t.Mailbox) then
+        Run.ScanMailbox()
+        HintPlanItems("mailbox")
+      elseif a1 == t.Banker or (t.AccountBanker and a1 == t.AccountBanker) then
+        HintPlanItems("bank")
+      end
+    end
   end
 end)

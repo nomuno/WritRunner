@@ -13,6 +13,9 @@ local defaults = {
   hideUnconfirmed = true,
   hideCompleted = true,
   showSealed = true,
+  useBagWrits = false,
+  rankByNet = false,
+  allowStartMissing = false,
   frame = { point = "CENTER", relativePoint = "CENTER", x = 0, y = 0 },
   completed = {},
   resetAt = 0,
@@ -127,6 +130,9 @@ events:SetScript("OnEvent", function(_, event, arg1, arg2, arg3)
     end
   elseif event == "QUEST_TURNED_IN" then
     WR.RecordReward(arg1, arg3)
+    if WR.Ledger and WR.Ledger.OnQuestTurnedIn then
+      WR.Ledger.OnQuestTurnedIn(arg1, arg3)
+    end
     -- Run first so the step is completed as a real turn-in (starts the
     -- timer). Daily also records it; OnDailyCompleted is then a no-op.
     if WR.Run and WR.Run.OnQuestTurnedIn then
@@ -143,7 +149,7 @@ SLASH_WRITRUNNER2 = "/writrunner"
 SlashCmdList.WRITRUNNER = function(msg)
   msg = (msg or ""):lower():match("^%s*(.-)%s*$")
   if msg == "help" then
-    WR.Print("Commands: /writs toggles the window. /writs start, /writs check, /writs track, /writs end, /writs minimap, /writs reroute (rebuild remaining run order), /writs reset (clears today's completed writs after a confirm popup).")
+    WR.Print("Commands: /writs toggles the window. /writs start, /writs check, /writs track, /writs end, /writs minimap, /writs reroute (rebuild remaining run order), /writs buy (step-by-step buying at the Auction House), /writs ahbutton (debug the AH title-bar button), /writs history (recent run totals), /writs reset (clears today's completed writs after a confirm popup).")
     return
   end
   if msg == "reset" then
@@ -195,8 +201,26 @@ SlashCmdList.WRITRUNNER = function(msg)
       end
       local report = WR.Run.CheckBags(source)
       if WR.Run.ShowBagReport then
-        WR.Run.ShowBagReport(report, "check")
+        WR.Run.ShowBagReport(report, "check", nil, source)
       end
+    end
+    return
+  end
+  if msg == "buy" then
+    if WR.Buyer and WR.Buyer.Start then
+      WR.Buyer.Start()
+    end
+    return
+  end
+  if msg == "ahbutton" or msg == "ah button" then
+    if WR.Buyer and WR.Buyer.DebugAHButton then
+      WR.Buyer.DebugAHButton()
+    end
+    return
+  end
+  if msg == "history" or msg == "hist" then
+    if WR.Ledger and WR.Ledger.ShowHistory then
+      WR.Ledger.ShowHistory()
     end
     return
   end

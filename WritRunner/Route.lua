@@ -315,6 +315,33 @@ function Route.WritWorldPos(writ)
 end
 
 -- Convert a 0-1 point on fromMapId onto toMapId, or nil if it is not on that map.
+-- True when we can build a travel path to this writ's NPC for the
+-- player's faction: a zone, an NPC, and coordinates that sit on the
+-- route graph (flight points, runs, boats and zeppelins).
+function Route.IsRoutable(writ, faction)
+  if not writ then
+    return false, "unknown writ"
+  end
+  if not writ.zone or writ.zone == "" then
+    return false, "no turn-in zone"
+  end
+  if not writ.npc or writ.npc == "" then
+    return false, "no turn-in NPC"
+  end
+  if not writ.coords or type(writ.coords.x) ~= "number" or type(writ.coords.y) ~= "number" then
+    return false, "no published coordinates"
+  end
+  local pos = Route.WritWorldPos(writ)
+  if not pos then
+    return false, "zone is not on the route graph"
+  end
+  local cont = pos.continent or Route.ContinentForZone(writ.zone)
+  if not cont or cont == "Unknown" then
+    return false, "zone is not on the route graph"
+  end
+  return true
+end
+
 function Route.MapPosOnMap(fromMapId, x, y, toMapId)
   if type(fromMapId) ~= "number" or type(toMapId) ~= "number" then
     return nil
@@ -1535,8 +1562,14 @@ function Route.Build(picked)
         rec.copperEach = copperEach
       end
     end
-    addShop(w.writItemId, w.writItemName, 1, row.price and row.price.writCopper)
-    addShop(w.requiredItemId, w.requiredItemName, w.requiredCount or 1, row.price and row.price.unitCopper)
+    -- Owned writs are already in bags (or the bank): don't put them on
+    -- the shopping list. Same for a fill item the player already has.
+    if not (row.price and row.price.ownedWrit) then
+      addShop(w.writItemId, w.writItemName, 1, row.price and row.price.writCopper)
+    end
+    if not (row.price and row.price.ownedFill) then
+      addShop(w.requiredItemId, w.requiredItemName, w.requiredCount or 1, row.price and row.price.unitCopper)
+    end
   end
 
   table.sort(shop, function(a, b)

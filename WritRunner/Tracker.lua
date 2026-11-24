@@ -211,6 +211,23 @@ function Tracker.RefreshStats()
   if d then
     parts[#parts + 1] = "Next " .. FmtYards(d)
   end
+  local spent = 0
+  if WR.Ledger and WR.Ledger.SpentForSteps then
+    spent = WR.Ledger.SpentForSteps(WR.Run and WR.Run.Steps and WR.Run.Steps())
+  elseif run.actualSpent then
+    spent = run.actualSpent
+  end
+  local income = (run.pouchGold or 0) + (run.questGold or 0)
+  if spent > 0 or income > 0 then
+    local net = income - spent
+    local netTxt = WR.MoneyText and WR.MoneyText(math.abs(net)) or tostring(net)
+    if net > 0 then
+      netTxt = "|cff55ff55+" .. netTxt .. "|r"
+    elseif net < 0 then
+      netTxt = "|cffff5555-" .. netTxt .. "|r"
+    end
+    parts[#parts + 1] = "Net " .. netTxt
+  end
   frame.stats:SetText(table.concat(parts, "   "))
 end
 
@@ -661,6 +678,16 @@ local function BuildFrame()
   skip:SetScript("OnClick", function()
     if WR.Run and WR.Run.SkipCurrent then
       WR.Run.SkipCurrent()
+    end
+  end)
+
+  local histBtn = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+  histBtn:SetSize(70, 20)
+  histBtn:SetPoint("BOTTOM", 0, 8)
+  histBtn:SetText("History")
+  histBtn:SetScript("OnClick", function()
+    if WR.Ledger and WR.Ledger.ShowHistory then
+      WR.Ledger.ShowHistory()
     end
   end)
 

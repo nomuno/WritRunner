@@ -16,6 +16,7 @@ local shown = {} -- what section 3 lists: the plan, or every writ when Show all 
 local picked = {}
 local spent = 0
 local plan = { shop = {}, route = {} }
+local bagOwned, bagSkipped = {}, {}
 local listOffset = 0
 local selectedIndex = nil
 local staged = {} -- [questId] = desired checked state (true = remove, false = restore)
@@ -53,6 +54,8 @@ local function Options()
     budgetCopper = WR.GoldToCopper(db.budgetGold),
     hideUnconfirmed = db.hideUnconfirmed ~= false,
     hideCompleted = db.hideCompleted ~= false,
+    useBagWrits = db.useBagWrits and true or false,
+    rankByNet = db.rankByNet and true or false,
   }
 end
 
@@ -87,21 +90,124 @@ local function ShopTerms()
   return terms, table.concat(terms, "\31")
 end
 
--- Keep Auctionator's "WritRunner" list matching the plan. Only runs after the
--- player has created the list once with the button, and only when it changed.
-local function SyncShoppingList()
-  if not WR.db or not WR.db.shopListSig then
-    return
+-- Shopping-list lock (1.2.3). Once the player makes the Auctionator list in
+-- #4, the plan is frozen: Auctionator price updates (every AH search updates
+-- its database) never re-pick writs or rewrite the Auctionator list. Only the
+-- Re-plan button (with a confirm popup) or the daily reset changes it.
+local lockDrift = false -- fresh prices/limits would pick a different plan
+
+local function CopyPrice(price)
+  local out = {}
+  if type(price) == "table" then
+    local k, v
+    for k, v in pairs(price) do
+      if type(v) == "number" or type(v) == "boolean" then
+        out[k] = v
+      end
+    end
   end
-  local terms, sig = ShopTerms()
-  if sig == WR.db.shopListSig or #terms == 0 then
-    return
+  return out
+end
+
+local function ActiveLock()
+  local db = WR.db
+  if not db or type(db.shopLock) ~= "table" then
+    return nil
   end
-  local ok = WR.TryAuctionatorShopping(terms, "WritRunner")
-  if ok then
-    WR.db.shopListSig = sig
-    WR.Print(string.format("Plan changed, so the Auctionator \"WritRunner\" shopping list was updated (%d items).", #terms))
+  local lock = db.shopLock
+  -- The lock belongs to one daily cycle; a new day starts a fresh plan.
+  if lock.resetAt and db.resetAt and math.abs(lock.resetAt - db.resetAt) > 120 then
+    db.shopLock = nil
+    return nil
   end
+  return lock
+end
+UI.ActiveLock = ActiveLock
+
+function UI.IsShopLocked()
+  return ActiveLock() ~= nil
+end
+
+function UI.ClearShopLock()
+  if WR.db then
+    WR.db.shopLock = nil
+  end
+  lockDrift = false
+end
+
+local function MakeLock(pickedRows, shopItems, spentCopper)
+  local lock = {
+    resetAt = WR.db and WR.db.resetAt or nil,
+    createdAt = (GetServerTime and GetServerTime()) or time(),
+    budgetGold = WR.db and WR.db.budgetGold or nil,
+    maxGold = WR.db and WR.db.maxGold or nil,
+    spent = spentCopper or 0,
+    writs = {},
+    prices = {},
+  }
+  local i
+  for i = 1, #(pickedRows or {}) do
+    local row = pickedRows[i]
+    if row.writ and row.writ.questId then
+      lock.writs[#lock.writs + 1] = { questId = row.writ.questId, price = CopyPrice(row.price) }
+    end
+  end
+  for i = 1, #(shopItems or {}) do
+    local item = shopItems[i]
+    if item.itemId then
+      lock.prices[item.itemId] = item.copperEach
+    end
+  end
+  return lock
+end
+
+-- Rows for the frozen plan: same writs, same prices as when it was locked.
+-- Writs turned in or removed today drop out of the route, but nothing is
+-- ever added and the Auctionator list is not touched.
+local function LockedPicked(lock)
+  local rows, total = {}, 0
+  local i
+  for i = 1, #(lock.writs or {}) do
+    local entry = lock.writs[i]
+    local w = WR.Daily and WR.Daily.WritByQuestId and WR.Daily.WritByQuestId(entry.questId)
+    if w and not (WR.Daily and WR.Daily.IsCompleted and WR.Daily.IsCompleted(w)) then
+      local price = CopyPrice(entry.price)
+      if price.known == nil then
+        price.known = price.totalCopper ~= nil
+      end
+      rows[#rows + 1] = { writ = w, price = price }
+      total = total + (price.totalCopper or 0)
+    end
+  end
+  return rows, total
+end
+
+local function QuestSet(rows)
+  local set, n = {}, 0
+  local i
+  for i = 1, #(rows or {}) do
+    local w = rows[i].writ
+    if w and w.questId and not set[w.questId] then
+      set[w.questId] = true
+      n = n + 1
+    end
+  end
+  return set, n
+end
+
+local function SameQuests(a, b)
+  local sa, na = QuestSet(a)
+  local sb, nb = QuestSet(b)
+  if na ~= nb then
+    return false
+  end
+  local q
+  for q in pairs(sa) do
+    if not sb[q] then
+      return false
+    end
+  end
+  return true
 end
 
 local function ShortWritName(name)
@@ -546,15 +652,48 @@ local function Rebuild()
   if WR.Daily then
     WR.Daily.EnsureReset()
   end
-  ranked = WR.RankWrits(Options())
+  WR.db.shopListSig = nil -- 1.2.2 auto-sync marker, no longer used
+  local opts = Options()
+  if opts.useBagWrits and WR.CollectBagWrits then
+    opts.bagOwned, opts.bagSkipped = WR.CollectBagWrits()
+  end
+  bagOwned, bagSkipped = opts.bagOwned or {}, opts.bagSkipped or {}
+  ranked = WR.RankWrits(opts)
   local budget = WR.GoldToCopper(WR.db.budgetGold)
-  picked, spent = WR.PickWithinBudget(ranked, budget)
+  local freshPicked, freshSpent = WR.PickWithinBudget(ranked, budget)
+  local lock = ActiveLock()
+  if lock then
+    -- Frozen: keep the locked writs and prices; only note whether a fresh
+    -- plan would differ so #4 can offer Re-plan. Never rewrite Auctionator.
+    picked, spent = LockedPicked(lock)
+    local freshOpen = {}
+    local i
+    for i = 1, #freshPicked do
+      local w = freshPicked[i].writ
+      if not (WR.Daily and WR.Daily.IsCompleted and WR.Daily.IsCompleted(w)) then
+        freshOpen[#freshOpen + 1] = freshPicked[i]
+      end
+    end
+    lockDrift = not SameQuests(picked, freshOpen)
+  else
+    picked, spent = freshPicked, freshSpent
+    lockDrift = false
+  end
   if WR.Route then
     plan = WR.Route.Build(picked)
   else
     plan = { shop = {}, route = {} }
   end
-  SyncShoppingList()
+  if lock and plan.shop then
+    local i
+    for i = 1, #plan.shop do
+      local item = plan.shop[i]
+      local frozen = lock.prices and lock.prices[item.itemId]
+      if frozen then
+        item.copperEach = frozen
+      end
+    end
+  end
   if WR.db.showAllWrits then
     shown = ranked
   else
@@ -624,7 +763,12 @@ function RefreshRows()
       end
       local writName = w.writItemName or ""
       writName = writName:gsub("^Craftsman's Writ: ", "")
-      row.name:SetText(nameColor .. Truncate(writName, 34) .. "|r")
+      if p.ownedWrit then
+        local tag = p.ownedBank and " |cff66cc66in bank|r" or " |cff66cc66owned|r"
+        row.name:SetText(nameColor .. Truncate(writName, 26) .. "|r" .. tag)
+      else
+        row.name:SetText(nameColor .. Truncate(writName, 34) .. "|r")
+      end
       local tierShort = (w.tier == "Journeyman") and "Journey" or (w.tier or "")
       row.tier:SetText(tierShort .. "  |cff40c0ff" .. (w.rep or 0) .. "|r")
       row.zone:SetText(Truncate(w.zone or "—", 20))
@@ -635,16 +779,29 @@ function RefreshRows()
         row.cost:SetText("|cffcc6666unknown|r")
         row.rpg:SetText("—")
       end
-      if p.netCopper then
-        if p.netCopper < 0 then
-          row.net:SetText("|cff40ff40+" .. WR.MoneyText(-p.netCopper) .. "|r")
-        else
-          row.net:SetText(WR.MoneyText(p.netCopper))
+      local function NetString(copper, approx)
+        local prefix = approx and "~" or ""
+        if copper < 0 then
+          return "|cff40ff40" .. prefix .. "+" .. WR.MoneyText(-copper) .. "|r"
         end
+        return prefix .. WR.MoneyText(copper)
+      end
+      if p.estNetKnown then
+        row.net:SetText(NetString(p.estNetCopper, true))
+      elseif p.netCopper then
+        row.net:SetText(NetString(p.netCopper, false))
       elseif p.known then
         row.net:SetText("|cff888888?|r")
       else
         row.net:SetText("—")
+      end
+      if p.estNetKnown and WR.db and WR.db.rankByNet then
+        local net = p.estNetCopper or 0
+        if net <= 0 then
+          row.rpg:SetText("~∞")
+        else
+          row.rpg:SetText(string.format("~%.1f", (w.rep or 0) / (net / 10000)))
+        end
       end
       row.conf:SetText(ConfLabel(w.confirmation))
       if pendingRemove then
@@ -710,6 +867,50 @@ function RefreshRows()
     if WR.db and WR.db.showAllWrits then
       q = string.format("Showing all %d writs. ", #ranked) .. string.format("%d qualify based on your limits in #2.", #picked)
     end
+    local ownedN = 0
+    local i
+    for i = 1, #picked do
+      if picked[i].price and picked[i].price.ownedWrit then
+        ownedN = ownedN + 1
+      end
+    end
+    if ownedN > 0 then
+      q = q .. string.format("  |cff66cc66%d from your bags.|r", ownedN)
+    end
+    if bagSkipped and #bagSkipped > 0 then
+      local bits = {}
+      local sk
+      for sk = 1, math.min(3, #bagSkipped) do
+        local w = bagSkipped[sk].writ
+        local name = (w.writItemName or "Writ"):gsub("^Craftsman's Writ: ", "")
+        bits[#bits + 1] = name .. " (" .. (bagSkipped[sk].reason or "unroutable") .. ")"
+      end
+      q = q .. string.format("  |cffcc6666Skipped %d bag writ%s: %s%s.|r",
+        #bagSkipped, #bagSkipped == 1 and "" or "s",
+        table.concat(bits, ", "),
+        #bagSkipped > 3 and (", +" .. (#bagSkipped - 3) .. " more") or "")
+    end
+    local estSum, estKnown, estMissing = 0, 0, 0
+    for i = 1, #picked do
+      local pr = picked[i].price
+      if pr and pr.estNetKnown then
+        estSum = estSum + (pr.estNetCopper or 0)
+        estKnown = estKnown + 1
+      elseif pr and pr.known then
+        estMissing = estMissing + 1
+      end
+    end
+    if estKnown > 0 then
+      if estSum < 0 then
+        q = q .. "  Est. net |cff40ff40~+" .. WR.MoneyText(-estSum) .. "|r"
+      else
+        q = q .. "  Est. net ~" .. WR.MoneyText(estSum)
+      end
+      if estMissing > 0 then
+        q = q .. string.format(" (pouch avg unknown for %d)", estMissing)
+      end
+      q = q .. "."
+    end
     frame.qualify:SetText(q)
   end
 
@@ -741,13 +942,59 @@ function RefreshRows()
   -- Shopping list
   local shopLines = {}
   local t
+  local locked = ActiveLock() ~= nil
+  if locked then
+    if lockDrift then
+      shopLines[#shopLines + 1] = "|cffffd100Locked.|r Prices or limits changed since you made this list. It will not change on its own; click Re-plan to rebuild it."
+    else
+      shopLines[#shopLines + 1] = "|cff66cc66Locked.|r Price updates will not change this list. Click Re-plan to rebuild it."
+    end
+  end
+  local nShop, nHave = 0, 0
   for t = 1, #plan.shop do
     local item = plan.shop[t]
     local price = item.copperEach and (WR.MoneyText(item.copperEach * item.count)) or "unknown"
-    shopLines[#shopLines + 1] = string.format("%dx %s  (%s)", item.count, item.name or ("item " .. item.itemId), price)
+    local name = item.name or ("item " .. item.itemId)
+    nShop = nShop + 1
+    if locked and WR.GetBagCount then
+      local have = WR.GetBagCount(item.itemId) or 0
+      local tag = ""
+      if WR.ItemLocations and WR.LocationTag then
+        local loc = WR.ItemLocations(item.itemId)
+        local locTag = WR.LocationTag(loc)
+        if locTag then
+          tag = " (" .. locTag .. ")"
+        end
+      end
+      if have >= item.count then
+        nHave = nHave + 1
+        shopLines[#shopLines + 1] = string.format("|cff66cc66[x] %dx %s  (%s)|r", item.count, name, price)
+      else
+        shopLines[#shopLines + 1] = string.format("[  ] %dx %s  (%s)  have %d%s", item.count, name, price, have, tag)
+      end
+    else
+      shopLines[#shopLines + 1] = string.format("%dx %s  (%s)", item.count, name, price)
+    end
   end
-  if #shopLines == 0 then
-    shopLines[1] = "No priced writs in the current plan. Set a budget or wait for Auctionator prices."
+  if nShop == 0 then
+    if locked then
+      shopLines[#shopLines + 1] = "Nothing left to buy for the locked plan."
+    else
+      local anyOwned, i = false
+      for i = 1, #picked do
+        if picked[i].price and picked[i].price.ownedWrit then
+          anyOwned = true
+          break
+        end
+      end
+      if anyOwned then
+        shopLines[#shopLines + 1] = "Nothing to buy — every writ and fill item is already in your bags (or the bank)."
+      else
+        shopLines[#shopLines + 1] = "No priced writs in the current plan. Set a budget or wait for Auctionator prices."
+      end
+    end
+  elseif locked then
+    shopLines[#shopLines + 1] = string.format("Have: %d of %d in bags. Bank and mail are noted on the line; take them out before Start run.", nHave, nShop)
   end
   frame.shopText:SetText(table.concat(shopLines, "\n"))
 
@@ -826,6 +1073,9 @@ function UI.Refresh()
   Rebuild()
   RefreshRows()
   UI.UpdateRunButtons()
+  if WR.Buyer and WR.Buyer.RefreshAHButton then
+    WR.Buyer.RefreshAHButton()
+  end
 end
 
 local function OnFilterChanged()
@@ -844,7 +1094,19 @@ local function OnFilterChanged()
   WR.db.hideCompleted = frame.hideDone:GetChecked() and true or false
   WR.db.showSealed = frame.showSealed:GetChecked() and true or false
   WR.db.showAllWrits = frame.showAll:GetChecked() and true or false
+  if frame.useBags then
+    WR.db.useBagWrits = frame.useBags:GetChecked() and true or false
+  end
+  if frame.rankByNet then
+    WR.db.rankByNet = frame.rankByNet:GetChecked() and true or false
+  end
+  if frame.allowStartMissing then
+    WR.db.allowStartMissing = frame.allowStartMissing:GetChecked() and true or false
+  end
   UI.Refresh()
+  if ActiveLock() and lockDrift then
+    WR.Print("The shopping list is locked, so new limits do not change it. Click Re-plan in #4 to apply them.")
+  end
 end
 
 local function CreateCheck(parent, label, x, y, checked)
@@ -979,7 +1241,7 @@ local function BuildFrame()
 
   -- 2. Limits
   Section(frame, "2. Set your limits",
-    "Budget gold is the most to spend on the whole run. Max per writ hides any single writ that costs more. Blank means no limit.", 18, -116)
+    "Budget gold is the most to spend on the whole run. Max per writ hides any single writ that costs more. Blank means no limit. Tick Use writs in my bags to add ones you already have.", 18, -116)
   frame.maxBox = CreateGoldBox(frame, "Max per writ", 32, -148, db.maxGold)
   frame.budgetBox = CreateGoldBox(frame, "Budget gold", 200, -148, db.budgetGold)
   frame.hideUnconf = CreateCheck(frame, "Hide unconfirmed", 340, -146, db.hideUnconfirmed ~= false)
@@ -1000,13 +1262,32 @@ local function BuildFrame()
     GameTooltip:Show()
   end)
   frame.applyBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
-  frame.sealed:SetPoint("TOPLEFT", 166, -175)
+
+  frame.useBags = CreateCheck(frame, "Use writs in my bags", 160, -168, db.useBagWrits and true or false)
+  frame.useBags:SetScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_TOP")
+    GameTooltip:SetText("Use writs in my bags")
+    GameTooltip:AddLine("Adds named writs already in your bags (and the bank) to the plan at no writ cost. If the fill item is also on hand, nothing is added to the shopping list; otherwise only that item is. Writs whose turn-in NPC has no known path are listed as skipped under #3, and are not added.", 1, 1, 1, true)
+    GameTooltip:Show()
+  end)
+  frame.useBags:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+  frame.sealed:SetPoint("TOPLEFT", 340, -175)
   frame.sealed:SetPoint("TOPRIGHT", -18, -175)
   frame.sealed:SetJustifyH("LEFT")
 
   -- 3. Plan
   Section(frame, "3. Check the plan",
     "Tick writs to remove, then Confirm — #4 and #5 update after you confirm. Reset restores ones you removed, not turn-ins.", 18, -206, 580)
+  frame.rankByNet = CreateCheck(frame, "Rank by net gold", 455, -204, WR.db and WR.db.rankByNet)
+  frame.rankByNet:SetScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_TOP")
+    GameTooltip:SetText("Rank by net gold")
+    GameTooltip:AddLine("Off: rank by reputation per gold of cost (writ + fill). On: rank by reputation per estimated net gold (cost minus the expected Coin Pouch). Pouch averages are learned from pouches you open after a turn-in. Until a tier has a sample, Artisan uses the Wowhead Looter average and Journeyman/Expert show ? and keep ranking by cost. Estimates are marked ~.", 1, 1, 1, true)
+    GameTooltip:Show()
+  end)
+  frame.rankByNet:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
   frame.showAll = CreateCheck(frame, "Show all writs", 620, -204, WR.db and WR.db.showAllWrits)
   frame.showAll:SetScript("OnEnter", function(self)
     GameTooltip:SetOwner(self, "ANCHOR_TOP")
@@ -1026,7 +1307,7 @@ local function BuildFrame()
   -- (list is at x=14, cells are offset inside each row).
   local headerCols = {
     { "Writ", 22, 200 }, { "Tier / Rep", 226, 80, "Writ tier and the rep its turn-in gives (Journeyman 75, Expert 125, Artisan 200)." }, { "Zone", 308, 130 },
-    { "Cost", 440, 80 }, { "Net", 522, 82, "Net cost after the turn-in pays you back:\nwrit + item - gold reward.\n\nThe reward is learned the first time you view or turn in that writ's quest; until then Net shows ?. Green means the turn-in pays more than it cost." },
+    { "Cost", 440, 80 }, { "Net", 522, 82, "Estimated net: cost minus the expected Coin Pouch (and any direct quest gold). ~ means an estimate. ? means that tier has no pouch average yet (open pouches after a turn-in to learn it). Green means you come out ahead. Artisan starts from the Wowhead Looter average until you have your own samples." },
     { "Rep/g", 606, 46 }, { "Src", 654, 50, "Where the turn-in NPC and location came from.\ncc = confirmed by the ConquestCapped writ guide.\ncc-partial = guide lists it but details are incomplete.\nunmapped = no confirmed turn-in yet." },
   }
   for _, col in ipairs(headerCols) do
@@ -1224,11 +1505,11 @@ local function BuildFrame()
   UpdatePlanButtons()
 
   Section(frame, "4. Buy writs and items",
-    "At the Auction House, click AH shopping list and buy everything below.", 18, panelY, 340)
+    "At the Auction House, click AH shopping list (locks the plan), then buy below or use Buy step by step.", 18, panelY, 340)
 
   local shopScroll = CreateFrame("ScrollFrame", "WritRunnerShopScroll", frame, "UIPanelScrollFrameTemplate")
   shopScroll:SetPoint("TOPLEFT", 32, panelY - 52)
-  shopScroll:SetSize(320, 120)
+  shopScroll:SetSize(320, 92)
   local shopChild = CreateFrame("Frame", nil, shopScroll)
   shopChild:SetSize(300, 120)
   shopScroll:SetScrollChild(shopChild)
@@ -1240,19 +1521,38 @@ local function BuildFrame()
   frame.shopText = shopText
   frame.shopChild = shopChild
 
+  frame.buyBtn = MakeButton("Buy step by step", 32, panelY - 148, function()
+    if WR.Buyer and WR.Buyer.Start then
+      WR.Buyer.Start()
+    end
+  end, 150)
+  frame.buyBtn:SetScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_TOP")
+    GameTooltip:SetText("Buy step by step")
+    GameTooltip:AddLine("With the Auction House open and the list locked, walks the list one item at a time: live price vs the scanned price, then Accept, Reject (drops its writs), Skip or Stop. Also /writs buy.", 1, 1, 1, true)
+    if not (WR.Buyer and WR.Buyer.IsAHOpen and WR.Buyer.IsAHOpen()) then
+      GameTooltip:AddLine("Open the Auction House first.", 1, 0.3, 0.3, true)
+    end
+    if not ActiveLock() then
+      GameTooltip:AddLine("Click AH shopping list first to lock the plan.", 1, 0.3, 0.3, true)
+    end
+    GameTooltip:Show()
+  end)
+  frame.buyBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
   local divider = frame:CreateTexture(nil, "ARTWORK")
   divider:SetColorTexture(0.6, 0.5, 0.2, 0.5)
   divider:SetPoint("TOPLEFT", 384, panelY + 2)
   divider:SetSize(1, 204)
 
   Section(frame, "5. Run the route",
-    "Collect mail, then Start run (it checks bags). Open each writ only at its NPC.", 400, panelY, 330)
+    "Start run checks bags only. Collect mail and withdraw from the bank first. Open each writ only at its NPC.", 400, panelY, 330)
 
   local routeScroll = CreateFrame("ScrollFrame", "WritRunnerRouteScroll", frame, "UIPanelScrollFrameTemplate")
   routeScroll:SetPoint("TOPLEFT", 414, panelY - 52)
-  routeScroll:SetSize(300, 120)
+  routeScroll:SetSize(300, 102)
   local routeChild = CreateFrame("Frame", nil, routeScroll)
-  routeChild:SetSize(280, 120)
+  routeChild:SetSize(280, 102)
   routeScroll:SetScrollChild(routeChild)
   local routeText = routeChild:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
   routeText:SetPoint("TOPLEFT", 0, 0)
@@ -1261,6 +1561,15 @@ local function BuildFrame()
   routeText:SetJustifyV("TOP")
   frame.routeText = routeText
   frame.routeChild = routeChild
+
+  frame.allowStartMissing = CreateCheck(frame, "Allow starting with missing items", 400, panelY - 160, WR.db and WR.db.allowStartMissing)
+  frame.allowStartMissing:SetScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_TOP")
+    GameTooltip:SetText("Allow starting with missing items")
+    GameTooltip:AddLine("Off (default): Start run will not open the tracker until every writ and fill item is in your bags. The popup lists anything still in the bank or mailbox, with Check again and Close. On: the popup also offers Start anyway, as before.", 1, 1, 1, true)
+    GameTooltip:Show()
+  end)
+  frame.allowStartMissing:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
   local btnY = panelY - 182
 
@@ -1279,19 +1588,27 @@ local function BuildFrame()
     WR.Print(msg)
   end, 110)
 
-  MakeButton("AH shopping list", 32, btnY, function()
-    UI.Refresh()
-    local terms, sig = ShopTerms()
-    if #terms == 0 then
-      WR.Print("The shopping list is empty.")
-      return
-    end
-    local ok, msg = WR.TryAuctionatorShopping(terms, "WritRunner")
-    if ok then
-      WR.db.shopListSig = sig
-    end
-    WR.Print(msg)
+  frame.shopBtn = MakeButton("AH shopping list", 32, btnY, function()
+    UI.MakeShoppingList()
   end, 150)
+  frame.shopBtn:SetScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_TOP")
+    GameTooltip:SetText("AH shopping list")
+    GameTooltip:AddLine("Creates the Auctionator \"WritRunner\" list and locks the plan, so price changes while you shop cannot change it. If it is already locked, this re-sends the same list.", 1, 1, 1, true)
+    GameTooltip:Show()
+  end)
+  frame.shopBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+  frame.replanBtn = MakeButton("Re-plan", 186, btnY, function()
+    UI.ConfirmReplan()
+  end, 82)
+  frame.replanBtn:SetScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_TOP")
+    GameTooltip:SetText("Re-plan")
+    GameTooltip:AddLine("Unlocks the shopping list, re-picks writs with current prices and limits, and replaces the Auctionator list. Asks first.", 1, 1, 1, true)
+    GameTooltip:Show()
+  end)
+  frame.replanBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
   -- Footer tip: full daily wipe is a slash command, not a button
   local footY = btnY - 26
@@ -1307,7 +1624,7 @@ local function BuildFrame()
   frame.checkBagsBtn:SetScript("OnEnter", function(self)
     GameTooltip:SetOwner(self, "ANCHOR_TOP")
     GameTooltip:SetText("Check bags")
-    GameTooltip:AddLine("Confirms every writ and required item for the current plan (or remaining run steps) is in your bags. Items still in the mailbox do not count — take them out first.", 1, 1, 1, true)
+    GameTooltip:AddLine("Confirms every writ and required item for the current plan (or remaining run steps) is in your bags. The popup says whether a missing item is in the bank, in the mailbox, or not owned.", 1, 1, 1, true)
     GameTooltip:Show()
   end)
   frame.checkBagsBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
@@ -1318,7 +1635,7 @@ local function BuildFrame()
   frame.startBtn:SetScript("OnEnter", function(self)
     GameTooltip:SetOwner(self, "ANCHOR_TOP")
     GameTooltip:SetText("Start run")
-    GameTooltip:AddLine("Checks your bags for every item in the plan, then opens the tracker. If something is missing, a popup lists it and you can start anyway or cancel. Take mailbox items out first.", 1, 1, 1, true)
+    GameTooltip:AddLine("Checks bags only, then opens the tracker. If anything is still in the bank or mailbox, the run does not start (unless you tick Allow starting with missing items). Visit the bank or mailbox, then Start run again.", 1, 1, 1, true)
     GameTooltip:Show()
   end)
   frame.startBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
@@ -1348,6 +1665,18 @@ function UI.Toggle()
       frame.hideUnconf:SetChecked(WR.db.hideUnconfirmed ~= false)
       frame.hideDone:SetChecked(WR.db.hideCompleted ~= false)
       frame.showSealed:SetChecked(WR.db.showSealed ~= false)
+      if frame.useBags then
+        frame.useBags:SetChecked(WR.db.useBagWrits and true or false)
+      end
+      if frame.rankByNet then
+        frame.rankByNet:SetChecked(WR.db.rankByNet and true or false)
+      end
+      if frame.showAll then
+        frame.showAll:SetChecked(WR.db.showAllWrits and true or false)
+      end
+      if frame.allowStartMissing then
+        frame.allowStartMissing:SetChecked(WR.db.allowStartMissing and true or false)
+      end
     end
     UI.Refresh()
     frame:Show()
@@ -1366,6 +1695,7 @@ function UI.GetPicked()
 end
 
 function UI.ResetAllToday()
+  UI.ClearShopLock()
   if WR.Daily and WR.Daily.ClearCompleted then
     WR.Daily.ClearCompleted()
     WR.Print("Cleared today's completed-writ list.")
@@ -1388,7 +1718,7 @@ function UI.CheckBags()
   end
   local report = WR.Run.CheckBags(source)
   if WR.Run.ShowBagReport then
-    WR.Run.ShowBagReport(report, "check")
+    WR.Run.ShowBagReport(report, "check", nil, source)
   end
 end
 
@@ -1416,9 +1746,151 @@ function UI.StartRunFromPlan()
   UI.UpdateRunButtons()
 end
 
+-- Step buyer Reject: drop writs from the locked plan, rebuild the route, and
+-- replace the Auctionator list to match. Returns true if Auctionator was
+-- updated (only with CreateShoppingList; the MultiSearch fallback would start
+-- a search and fight the buyer's own searches).
+function UI.RemoveLockedWrits(questIds)
+  local lock = ActiveLock()
+  if not lock or not questIds or #questIds == 0 then
+    return false
+  end
+  local drop = {}
+  local i
+  for i = 1, #questIds do
+    drop[questIds[i]] = true
+  end
+  local keep = {}
+  for i = 1, #(lock.writs or {}) do
+    if not drop[lock.writs[i].questId] then
+      keep[#keep + 1] = lock.writs[i]
+    end
+  end
+  lock.writs = keep
+  lock.rejected = lock.rejected or {}
+  for i = 1, #questIds do
+    lock.rejected[#lock.rejected + 1] = questIds[i]
+  end
+  Rebuild()
+  if frame and frame:IsShown() then
+    RefreshRows()
+  end
+  if WR.Run and WR.Run.IsActive and WR.Run.IsActive() then
+    WR.Print("A run is active; /writs reroute or Restart run to drop the rejected writs from it.")
+  end
+  local api = Auctionator and Auctionator.API and Auctionator.API.v1
+  if api and api.CreateShoppingList then
+    local terms = ShopTerms()
+    if #terms > 0 then
+      local ok = WR.TryAuctionatorShopping(terms, "WritRunner")
+      return ok and true or false
+    end
+  end
+  return false
+end
+
+-- #4 button: make the Auctionator list from the current plan and lock it.
+-- If already locked, re-send the same frozen list without re-planning.
+function UI.MakeShoppingList()
+  local wasLocked = ActiveLock() ~= nil
+  Rebuild()
+  if frame and frame:IsShown() then
+    RefreshRows()
+  end
+  local terms = ShopTerms()
+  if #terms == 0 then
+    WR.Print(wasLocked and "Nothing left to buy for the locked plan." or "The shopping list is empty.")
+    return
+  end
+  local ok, msg = WR.TryAuctionatorShopping(terms, "WritRunner")
+  if ok and WR.db then
+    if not wasLocked then
+      WR.db.shopLock = MakeLock(picked, plan.shop, spent)
+      lockDrift = false
+      msg = msg .. ". Plan locked: price updates will not change it (Re-plan to rebuild)."
+    else
+      msg = msg .. ". Same locked plan re-sent."
+    end
+  end
+  WR.Print(msg)
+  if frame and frame:IsShown() then
+    RefreshRows()
+  end
+  UI.UpdateRunButtons()
+end
+
+function UI.ConfirmReplan()
+  local lock = ActiveLock()
+  if not lock then
+    UI.ShowConfirm({
+      title = "WritRunner",
+      message = "The shopping list is not locked, so the plan already follows current prices. Click AH shopping list to make and lock it.",
+      accept = "OK",
+    })
+    return
+  end
+  -- Preview what a fresh plan would be without changing anything yet.
+  Rebuild()
+  local budget = WR.db and WR.GoldToCopper(WR.db.budgetGold)
+  local freshPicked, freshSpent = WR.PickWithinBudget(ranked, budget)
+  local oldSet = QuestSet(picked)
+  local newSet = QuestSet(freshPicked)
+  local lines = {}
+  local i
+  for i = 1, #freshPicked do
+    local w = freshPicked[i].writ
+    if w and w.questId and not oldSet[w.questId] then
+      lines[#lines + 1] = "  |cff66cc66+|r " .. ShortWritName(w.writItemName)
+    end
+  end
+  for i = 1, #picked do
+    local w = picked[i].writ
+    if w and w.questId and not newSet[w.questId] then
+      lines[#lines + 1] = "  |cffcc6666-|r " .. ShortWritName(w.writItemName)
+    end
+  end
+  local message
+  if #lines == 0 then
+    message = string.format("Re-plan with current prices? Same writs, estimated cost %s.", WR.MoneyText(freshSpent))
+  else
+    message = string.format("Re-plan with current prices? %d writ change%s, estimated cost %s (was %s).",
+      #lines, #lines == 1 and "" or "s", WR.MoneyText(freshSpent), WR.MoneyText(spent))
+  end
+  UI.ShowConfirm({
+    title = "Re-plan shopping list",
+    message = message,
+    lines = lines,
+    footer = "This replaces the Auctionator \"WritRunner\" list and locks the new plan. Items already in your bags still count.",
+    accept = "Re-plan",
+    cancel = "Cancel",
+    OnAccept = function()
+      UI.ClearShopLock()
+      UI.Refresh()
+      UI.MakeShoppingList()
+    end,
+  })
+end
+
 function UI.UpdateRunButtons()
+  if WR.Buyer and WR.Buyer.RefreshAHButton then
+    WR.Buyer.RefreshAHButton()
+  end
   if not frame then
     return
+  end
+  if frame.buyBtn then
+    if ActiveLock() and WR.Buyer and WR.Buyer.IsAHOpen and WR.Buyer.IsAHOpen() then
+      frame.buyBtn:Enable()
+    else
+      frame.buyBtn:Disable()
+    end
+  end
+  if frame.replanBtn then
+    if ActiveLock() then
+      frame.replanBtn:Enable()
+    else
+      frame.replanBtn:Disable()
+    end
   end
   if frame.startBtn then
     if WR.Run and WR.Run.IsActive and WR.Run.IsActive() then
@@ -1445,8 +1917,25 @@ login:SetScript("OnEvent", function()
     return
   end
   if Auctionator and Auctionator.API and Auctionator.API.v1 and Auctionator.API.v1.RegisterForDBUpdate then
+    -- Auctionator fires this on every AH search. Coalesce bursts; a locked
+    -- plan only refreshes its display and the "prices changed" notice.
+    local pending
     local ok = pcall(Auctionator.API.v1.RegisterForDBUpdate, WR.CALLER_ID, function()
-      if frame and frame:IsShown() then
+      if not frame or not frame:IsShown() then
+        return
+      end
+      if C_Timer and C_Timer.After then
+        if pending then
+          return
+        end
+        pending = true
+        C_Timer.After(0.5, function()
+          pending = false
+          if frame and frame:IsShown() then
+            UI.Refresh()
+          end
+        end)
+      else
         UI.Refresh()
       end
     end)
@@ -1454,6 +1943,45 @@ login:SetScript("OnEvent", function()
   end
 end)
 
+
+-- If "Use writs in my bags" is on and the plan is not locked, rebuild
+-- when bags change so newly looted writs appear. Locked plans stay frozen.
+local bagWatch = CreateFrame("Frame")
+local bagPending
+bagWatch:RegisterEvent("BAG_UPDATE_DELAYED")
+bagWatch:RegisterEvent("BAG_UPDATE")
+bagWatch:SetScript("OnEvent", function()
+  if not WR.db or not WR.db.useBagWrits then
+    return
+  end
+  if not frame or not frame:IsShown() then
+    return
+  end
+  if ActiveLock() then
+    if RefreshRows then
+      RefreshRows()
+    end
+    if WR.Buyer and WR.Buyer.RefreshAHButton then
+      WR.Buyer.RefreshAHButton()
+    end
+    return
+  end
+  if bagPending then
+    return
+  end
+  bagPending = true
+  local function flush()
+    bagPending = nil
+    if frame and frame:IsShown() and WR.db and WR.db.useBagWrits and not ActiveLock() then
+      UI.Refresh()
+    end
+  end
+  if C_Timer and C_Timer.After then
+    C_Timer.After(0.3, flush)
+  else
+    flush()
+  end
+end)
 
 -- Minimap button: left-click opens WritRunner, right-click toggles the run
 -- tracker, drag to move it around the minimap edge.
