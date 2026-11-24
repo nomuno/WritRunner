@@ -1,3 +1,7 @@
+# 1.2.1
+
+- Fixed the run timer not starting on the first writ hand-in. `QUEST_TURNED_IN` was recorded by the daily-completion tracker first, which marked the step done as a "daily" update and skipped the clock. The clock now starts on the first real turn-in (quest event, bag fallback, or a daily mark that came from a turn-in), and also if you click Skip / Mark done after handing in. If a run is already past the first step with the timer still stopped, it starts at the next real turn-in.
+
 # 1.2.0
 
 Planner

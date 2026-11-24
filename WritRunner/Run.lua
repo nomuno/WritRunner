@@ -710,7 +710,19 @@ local function LookupWrit(step)
   return nil
 end
 
-local function CompleteStep(index, how)
+-- Start the clock on the first real turn-in. "daily" is used both for a
+-- QUEST_TURNED_IN that Daily recorded first (source "turnin") and for a
+-- #3 Confirm removal (source "manual") — only the former should start it.
+-- Skip / Mark done also starts it: the tracker button is often clicked
+-- right after a hand-in if detection missed the quest event.
+local function IsClockStart(how, dailySource)
+  if how == "quest" or how == "bags" or how == "skip" or how == "manual" then
+    return true
+  end
+  return how == "daily" and dailySource ~= "manual"
+end
+
+local function CompleteStep(index, how, dailySource)
   local run = Run.Get()
   if not run or not run.steps or not run.steps[index] then
     return
@@ -720,10 +732,11 @@ local function CompleteStep(index, how)
     return
   end
   step.done = true
-  if run.clockStarted == false then
-    if how == "quest" or how == "bags" then
+  if not run.clockStarted then
+    if IsClockStart(how, dailySource) then
       -- First real turn-in: start the clock here, so waiting at the AH or
-      -- the trip before it doesn't count.
+      -- the trip before it doesn't count. clockStarted lives in
+      -- WritRunnerDB.run, so a /reload mid-run keeps the state.
       run.clockStarted = true
       run.elapsed, run.distance = 0, 0
       run.splitElapsed, run.splitDist = 0, 0
@@ -737,9 +750,9 @@ local function CompleteStep(index, how)
     run.splitDist = run.distance or 0
   end
   local writ = LookupWrit(step)
-  if (how == "quest" or how == "bags") and WR.Rep and WR.Rep.VerifyTurnIn then
+  if (how == "quest" or how == "bags" or (how == "daily" and dailySource ~= "manual")) and WR.Rep and WR.Rep.VerifyTurnIn then
     WR.Rep.VerifyTurnIn(step, step.rep or (writ and writ.rep))
-  elseif how == "skip" or how == "manual" then
+  elseif how == "skip" or how == "manual" or (how == "daily" and dailySource == "manual") then
     step.repStatus = "skipped"
   end
   -- "daily" means #3 already recorded the source (manual or turn-in).
@@ -790,7 +803,7 @@ function Run.OnQuestTurnedIn(questId)
 end
 
 -- If the main window's daily checkbox is ticked for a writ in this run, sync.
-function Run.OnDailyCompleted(writ, done)
+function Run.OnDailyCompleted(writ, done, source)
   if not Run.IsActive() or not writ or not writ.questId or not done then
     return
   end
@@ -798,7 +811,7 @@ function Run.OnDailyCompleted(writ, done)
   local i
   for i = 1, #steps do
     if not steps[i].done and steps[i].questId == writ.questId then
-      CompleteStep(i, "daily")
+      CompleteStep(i, "daily", source)
       return
     end
   end
@@ -884,7 +897,7 @@ ticker:SetScript("OnUpdate", function(_, dt)
     lastY = nil
     return
   end
-  if run.clockStarted == false then
+  if not run.clockStarted then
     lastY = nil
     acc = acc + dt
     if acc >= 0.5 then
