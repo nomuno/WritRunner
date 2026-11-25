@@ -149,7 +149,7 @@ SLASH_WRITRUNNER2 = "/writrunner"
 SlashCmdList.WRITRUNNER = function(msg)
   msg = (msg or ""):lower():match("^%s*(.-)%s*$")
   if msg == "help" then
-    WR.Print("Commands: /writs toggles the window. /writs start, /writs check, /writs track, /writs end, /writs minimap, /writs reroute (rebuild remaining run order), /writs buy (step-by-step buying at the Auction House), /writs ahbutton (debug the AH title-bar button), /writs history (recent run totals), /writs reset (clears today's completed writs after a confirm popup).")
+    WR.Print("Commands: /writs toggles the window. /writs start, /writs check, /writs track, /writs end, /writs minimap, /writs reroute (rebuild remaining run order), /writs buy (step-by-step buying at the Auction House), /writs ahbutton (debug the AH title-bar button), /writs history (recent run totals), /writs pouches (learned Coin Pouch averages), /writs pouches export (copyable stats line), /writs reset (clears today's completed writs after a confirm popup).")
     return
   end
   if msg == "reset" then
@@ -221,6 +221,18 @@ SlashCmdList.WRITRUNNER = function(msg)
   if msg == "history" or msg == "hist" then
     if WR.Ledger and WR.Ledger.ShowHistory then
       WR.Ledger.ShowHistory()
+    end
+    return
+  end
+  if msg == "pouches" or msg == "pouch" then
+    if WR.Ledger and WR.Ledger.PrintPouchStats then
+      WR.Ledger.PrintPouchStats()
+    end
+    return
+  end
+  if msg == "pouches export" or msg == "pouch export" then
+    if WR.Ledger and WR.Ledger.ShowPouchExport then
+      WR.Ledger.ShowPouchExport()
     end
     return
   end

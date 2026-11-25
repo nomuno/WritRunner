@@ -121,6 +121,12 @@ function WR.GoldToCopper(gold)
   if gold == nil or gold == "" then
     return nil
   end
+  if type(gold) == "string" then
+    gold = gold:gsub("^%s+", ""):gsub("%s+$", ""):gsub("[gG]$", "")
+  end
+  if gold == "" then
+    return nil
+  end
   local n = tonumber(gold)
   if not n or n < 0 then
     return nil
@@ -142,7 +148,10 @@ function WR.ApplyOwnedPricing(price, writ, haveWrit, haveFill)
     price.itemCopper = 0
     price.totalCopper = 0
     price.known = true
-    price.repPerGold = 1e9
+    -- Leave repPerGold nil: a 1e9 sentinel used to sort these first
+    -- but showed up in #3 as "1000000000.00 reputation per gold".
+    -- RankWrits still treats free owned writs as best-in-list.
+    price.repPerGold = nil
     if price.rewardCopper then
       price.netCopper = 0 - price.rewardCopper
     end
@@ -152,7 +161,7 @@ function WR.ApplyOwnedPricing(price, writ, haveWrit, haveFill)
     if price.known and price.totalCopper and price.totalCopper > 0 and writ and writ.rep then
       price.repPerGold = writ.rep / (price.totalCopper / 10000)
     elseif price.known then
-      price.repPerGold = 1e9
+      price.repPerGold = nil
     end
     if price.known and price.rewardCopper then
       price.netCopper = (price.totalCopper or 0) - price.rewardCopper
@@ -161,6 +170,46 @@ function WR.ApplyOwnedPricing(price, writ, haveWrit, haveFill)
     end
   end
   return price
+end
+
+-- True when a bag-owned writ costs nothing more to buy (writ and fill
+-- already on hand). Rep/g is not a meaningful number in that case.
+function WR.IsFreeOwnedWrit(price)
+  return price and price.ownedWrit and (not price.totalCopper or price.totalCopper <= 0) and true or false
+end
+
+-- Display text for the #3 Rep/g column. Free owned writs are blank
+-- (do not show a sort sentinel or "~∞"). Unknown prices show "—".
+function WR.FormatRepPerGold(price, writ, rankByNet)
+  if WR.IsFreeOwnedWrit(price) then
+    return ""
+  end
+  if rankByNet and price and price.estNetKnown then
+    local net = price.estNetCopper or 0
+    if net <= 0 then
+      return "~∞"
+    end
+    return string.format("~%.1f", ((writ and writ.rep) or 0) / (net / 10000))
+  end
+  if not price or not price.known then
+    return "—"
+  end
+  if price.repPerGold then
+    return string.format("%.1f", price.repPerGold)
+  end
+  return "—"
+end
+
+-- Tooltip line for Rep/g, or nil to omit. Free owned writs say
+-- "Already owned" instead of a bogus reputation-per-gold figure.
+function WR.RepPerGoldTooltipLine(price, writ, rankByNet)
+  if WR.IsFreeOwnedWrit(price) then
+    return "Already owned"
+  end
+  if price and price.repPerGold then
+    return string.format("%.2f reputation per gold", price.repPerGold)
+  end
+  return nil
 end
 
 function WR.ExpectedPouchCopper(tier)
@@ -324,6 +373,10 @@ function WR.RankWrits(opts)
     end
   end
   local function Rpg(row)
+    -- Free owned writs sort first. 1e9 is sort-only; the UI leaves Rep/g blank.
+    if row.price and row.price.ownedWrit and (not row.price.totalCopper or row.price.totalCopper <= 0) then
+      return 1e9
+    end
     if opts.rankByNet and row.price.estNetKnown and row.writ and row.writ.rep then
       local net = row.price.estNetCopper or 0
       if net <= 0 then

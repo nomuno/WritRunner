@@ -774,11 +774,10 @@ function RefreshRows()
       row.zone:SetText(Truncate(w.zone or "—", 20))
       if p.known then
         row.cost:SetText(WR.MoneyText(p.totalCopper))
-        row.rpg:SetText(string.format("%.1f", p.repPerGold))
       else
         row.cost:SetText("|cffcc6666unknown|r")
-        row.rpg:SetText("—")
       end
+      row.rpg:SetText(WR.FormatRepPerGold(p, w, WR.db and WR.db.rankByNet))
       local function NetString(copper, approx)
         local prefix = approx and "~" or ""
         if copper < 0 then
@@ -794,14 +793,6 @@ function RefreshRows()
         row.net:SetText("|cff888888?|r")
       else
         row.net:SetText("—")
-      end
-      if p.estNetKnown and WR.db and WR.db.rankByNet then
-        local net = p.estNetCopper or 0
-        if net <= 0 then
-          row.rpg:SetText("~∞")
-        else
-          row.rpg:SetText(string.format("~%.1f", (w.rep or 0) / (net / 10000)))
-        end
       end
       row.conf:SetText(ConfLabel(w.confirmation))
       if pendingRemove then
@@ -1078,7 +1069,20 @@ function UI.Refresh()
   end
 end
 
-local function OnFilterChanged()
+-- When the plan is locked, a price-scan should only flip the #4 banner.
+-- Do not re-rank or re-route (that hitch is why the window felt laggy
+-- during an Auctionator rescan).
+function UI.NotePriceDrift()
+  if not ActiveLock() then
+    return
+  end
+  lockDrift = true
+  if frame and frame:IsShown() then
+    RefreshRows()
+  end
+end
+
+function UI.SaveFilters()
   if not WR.db or not frame then
     return
   end
@@ -1103,10 +1107,50 @@ local function OnFilterChanged()
   if frame.allowStartMissing then
     WR.db.allowStartMissing = frame.allowStartMissing:GetChecked() and true or false
   end
+end
+
+-- Fresh pick from current prices and limits, without touching the locked plan.
+function UI.PreviewPick()
+  local opts = Options()
+  if opts.useBagWrits and WR.CollectBagWrits then
+    opts.bagOwned, opts.bagSkipped = WR.CollectBagWrits()
+  end
+  local rankedNow = WR.RankWrits(opts)
+  local budget = WR.GoldToCopper(WR.db and WR.db.budgetGold)
+  local fresh, freshSpent = WR.PickWithinBudget(rankedNow, budget)
+  return fresh, freshSpent, rankedNow
+end
+
+local function OnFilterChanged()
+  UI.SaveFilters()
   UI.Refresh()
   if ActiveLock() and lockDrift then
-    WR.Print("The shopping list is locked, so new limits do not change it. Click Re-plan in #4 to apply them.")
+    WR.Print("The shopping list is locked, so new limits do not change it. Click Apply limits or Re-plan to rebuild it.")
   end
+end
+
+-- Deliberate apply: if the list is locked and the new limits would change
+-- the plan, ask to re-plan (same confirm as Re-plan). Otherwise rebuild now.
+function UI.ApplyLimits()
+  if frame then
+    if frame.maxBox then frame.maxBox:ClearFocus() end
+    if frame.budgetBox then frame.budgetBox:ClearFocus() end
+  end
+  UI.SaveFilters()
+  if ActiveLock() then
+    local fresh, freshSpent = UI.PreviewPick()
+    local lockedRows = picked
+    if not lockedRows then
+      lockedRows = LockedPicked(ActiveLock())
+    end
+    if not SameQuests(lockedRows, fresh) then
+      UI.ConfirmReplan({ fromApply = true, freshPicked = fresh, freshSpent = freshSpent })
+      return
+    end
+  end
+  UI.Refresh()
+  WR.Print(string.format("Limits applied: %d writs qualify, spend %s.",
+    #picked, WR.MoneyText(spent)))
 end
 
 local function CreateCheck(parent, label, x, y, checked)
@@ -1134,9 +1178,15 @@ local function CreateGoldBox(parent, label, x, y, initial)
   edit:SetText(initial or "")
   edit:SetScript("OnEnterPressed", function(self)
     self:ClearFocus()
-    OnFilterChanged()
+    UI.ApplyLimits()
   end)
-  edit:SetScript("OnEditFocusLost", OnFilterChanged)
+  edit:SetScript("OnEditFocusLost", function()
+    UI.SaveFilters()
+    if ActiveLock() then
+      return
+    end
+    UI.Refresh()
+  end)
   edit:SetScript("OnEnter", function(self)
     GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
     GameTooltip:SetText(label)
@@ -1250,15 +1300,12 @@ local function BuildFrame()
 
   frame.sealed = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
   frame.applyBtn = MakeButton("Apply limits", 32, -170, function()
-    if frame.maxBox then frame.maxBox:ClearFocus() end
-    if frame.budgetBox then frame.budgetBox:ClearFocus() end
-    OnFilterChanged()
-    WR.Print(string.format("Limits applied: %d writs qualify.", #picked))
+    UI.ApplyLimits()
   end, 120)
   frame.applyBtn:SetScript("OnEnter", function(self)
     GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
     GameTooltip:SetText("Apply limits")
-    GameTooltip:AddLine("Saves Max per writ and Budget gold and updates the lists in 3, 4 and 5. Same as pressing Enter in either box.", 1, 1, 1, true)
+    GameTooltip:AddLine("Saves Max per writ and Budget gold and rebuilds the plan in #3, #4 and #5. Same as pressing Enter in either box. If the shopping list is locked, you will be asked to re-plan so the new limits actually take effect.", 1, 1, 1, true)
     GameTooltip:Show()
   end)
   frame.applyBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
@@ -1283,7 +1330,7 @@ local function BuildFrame()
   frame.rankByNet:SetScript("OnEnter", function(self)
     GameTooltip:SetOwner(self, "ANCHOR_TOP")
     GameTooltip:SetText("Rank by net gold")
-    GameTooltip:AddLine("Off: rank by reputation per gold of cost (writ + fill). On: rank by reputation per estimated net gold (cost minus the expected Coin Pouch). Pouch averages are learned from pouches you open after a turn-in. Until a tier has a sample, Artisan uses the Wowhead Looter average and Journeyman/Expert show ? and keep ranking by cost. Estimates are marked ~.", 1, 1, 1, true)
+    GameTooltip:AddLine("Off: rank by reputation per gold of cost (writ + fill). On: rank by reputation per estimated net gold (cost minus the expected Coin Pouch). Pouch averages are learned from every pouch you open (saved across runs). Until a tier has a sample, Artisan uses the Wowhead Looter average and Journeyman/Expert show ? and keep ranking by cost. Estimates are marked ~. See /writs pouches.", 1, 1, 1, true)
     GameTooltip:Show()
   end)
   frame.rankByNet:SetScript("OnLeave", function() GameTooltip:Hide() end)
@@ -1439,8 +1486,24 @@ local function BuildFrame()
       else
         GameTooltip:AddLine("Turn-in gold reward not learned yet (view or turn in this writ once).", 0.6, 0.6, 0.6, true)
       end
-      if p.repPerGold then
-        GameTooltip:AddLine(string.format("%.2f reputation per gold", p.repPerGold), 0.7, 1, 0.7)
+      if p.estPouch then
+        local src
+        if p.estPouchKind == "learned" then
+          src = string.format("from %d of your pouches", p.estPouchN or 0)
+        else
+          src = p.estPouchSource or "seeded average"
+        end
+        GameTooltip:AddLine("Coin Pouch est.: ~" .. WR.MoneyText(p.estPouch) .. " (" .. src .. ")", 0.9, 0.85, 0.5)
+      elseif w.tier then
+        GameTooltip:AddLine("Coin Pouch average for " .. w.tier .. " not learned yet. /writs pouches", 0.6, 0.6, 0.6)
+      end
+      local rpgTip = WR.RepPerGoldTooltipLine(p, w, WR.db and WR.db.rankByNet)
+      if rpgTip then
+        if rpgTip == "Already owned" then
+          GameTooltip:AddLine(rpgTip, 0.4, 1, 0.4)
+        else
+          GameTooltip:AddLine(rpgTip, 0.7, 1, 0.7)
+        end
       end
       local dest = (w.npc or "unknown NPC") .. " — " .. (w.zone or "unknown zone")
       if w.coords then
@@ -1819,20 +1882,28 @@ function UI.MakeShoppingList()
   UI.UpdateRunButtons()
 end
 
-function UI.ConfirmReplan()
+function UI.ConfirmReplan(opts)
+  opts = opts or {}
+  if frame then
+    if frame.maxBox then frame.maxBox:ClearFocus() end
+    if frame.budgetBox then frame.budgetBox:ClearFocus() end
+  end
+  UI.SaveFilters()
   local lock = ActiveLock()
   if not lock then
     UI.ShowConfirm({
       title = "WritRunner",
-      message = "The shopping list is not locked, so the plan already follows current prices. Click AH shopping list to make and lock it.",
+      message = "The shopping list is not locked, so the plan already follows current prices and limits. Click AH shopping list to make and lock it.",
       accept = "OK",
     })
     return
   end
   -- Preview what a fresh plan would be without changing anything yet.
-  Rebuild()
-  local budget = WR.db and WR.GoldToCopper(WR.db.budgetGold)
-  local freshPicked, freshSpent = WR.PickWithinBudget(ranked, budget)
+  -- Always use the budget/limits currently in the boxes, not the locked ones.
+  local freshPicked, freshSpent = opts.freshPicked, opts.freshSpent
+  if not freshPicked then
+    freshPicked, freshSpent = UI.PreviewPick()
+  end
   local oldSet = QuestSet(picked)
   local newSet = QuestSet(freshPicked)
   local lines = {}
@@ -1850,18 +1921,19 @@ function UI.ConfirmReplan()
     end
   end
   local message
+  local verb = opts.fromApply and "Apply these limits and re-plan" or "Re-plan with current prices"
   if #lines == 0 then
-    message = string.format("Re-plan with current prices? Same writs, estimated cost %s.", WR.MoneyText(freshSpent))
+    message = string.format("%s? Same writs, estimated cost %s.", verb, WR.MoneyText(freshSpent))
   else
-    message = string.format("Re-plan with current prices? %d writ change%s, estimated cost %s (was %s).",
-      #lines, #lines == 1 and "" or "s", WR.MoneyText(freshSpent), WR.MoneyText(spent))
+    message = string.format("%s? %d writ change%s, estimated cost %s (was %s).",
+      verb, #lines, #lines == 1 and "" or "s", WR.MoneyText(freshSpent), WR.MoneyText(spent))
   end
   UI.ShowConfirm({
-    title = "Re-plan shopping list",
+    title = opts.fromApply and "Apply limits" or "Re-plan shopping list",
     message = message,
     lines = lines,
     footer = "This replaces the Auctionator \"WritRunner\" list and locks the new plan. Items already in your bags still count.",
-    accept = "Re-plan",
+    accept = opts.fromApply and "Apply and re-plan" or "Re-plan",
     cancel = "Cancel",
     OnAccept = function()
       UI.ClearShopLock()
@@ -1929,14 +2001,26 @@ login:SetScript("OnEvent", function()
           return
         end
         pending = true
-        C_Timer.After(0.5, function()
+        -- Locked: only flip the #4 banner, no re-rank or re-route.
+        -- Unlocked: debounce a full refresh; 1s so a scan does not hitch.
+        local delay = ActiveLock() and 0.3 or 1.0
+        C_Timer.After(delay, function()
           pending = false
-          if frame and frame:IsShown() then
+          if not (frame and frame:IsShown()) then
+            return
+          end
+          if ActiveLock() then
+            UI.NotePriceDrift()
+          else
             UI.Refresh()
           end
         end)
       else
-        UI.Refresh()
+        if ActiveLock() then
+          UI.NotePriceDrift()
+        else
+          UI.Refresh()
+        end
       end
     end)
     hookRegistered = ok and true or false

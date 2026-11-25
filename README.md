@@ -2,7 +2,7 @@
 
 Cheapest-path Craftsman's Writ reputation planner for WoW: Forever, using Auctionator prices, with a run tracker, map pins, and bag check.
 
-**Version 1.3.5** · Interface 16001 · WoW: Forever · by Darth
+**Version 1.3.8** · Interface 16001 · WoW: Forever · by Darth
 
 ## Install with WowUp
 
@@ -12,14 +12,12 @@ Cheapest-path Craftsman's Writ reputation planner for WoW: Forever, using Auctio
 
 ## Manual install
 
-Download `WritRunner-1.3.5-forever.zip` from the [latest release](https://github.com/nomuno/WritRunner/releases/latest) and unzip it into `World of Warcraft/_forever_/Interface/AddOns`.
+Download `WritRunner-1.3.8-forever.zip` from the [latest release](https://github.com/nomuno/WritRunner/releases/latest) and unzip it into `World of Warcraft/_forever_/Interface/AddOns`.
 
-## What's new in 1.3.5
+## What's new in 1.3.8
 
-- **Start run checks bags only.** If any writ or fill item is missing from your bags, the tracker does not start. The popup lists each missing item and where it is: in the bank, in the mailbox (last inbox scan, plus today's purchases not yet collected), or not owned, with a hint to visit the bank or mailbox and Start run again. Buttons are **Check again** and **Close**.
-- A checkbox in #5, **Allow starting with missing items** (off by default, saved), restores the old **Start anyway** button.
-- **Check bags** uses the same location breakdown. The locked shopping list in #4 shows compact tags such as `have 0 (bank 1, mail 1)` and ticks off only items actually in bags.
-- Opening the bank or mailbox prints a one-line chat hint if a plan item is sitting there. Mail is scanned on MAIL_SHOW / MAIL_INBOX_UPDATE only while the mailbox is open (no taint, no secure hooks).
+- **Apply limits honors the budget, even when the shopping list is locked.** A 5g budget no longer leaves an old 87-writ (144g+) plan in place. The lock still protects the list from Auctionator price updates while you shop, but a deliberate Apply limits (or Enter in the Budget / Max box) now asks to re-plan with the new limits, then rebuilds and relocks. Re-plan also reads the current boxes first, so the budget you just typed is the one it uses. "Limits applied" reports the plan that actually qualifies, not the frozen list.
+- **Less lag during an Auctionator scan.** With the window open and the plan locked, price-database updates only flip the #4 "prices changed" banner. They no longer re-rank every writ or rebuild the 87-stop route on each pulse (that was the hitch). Unlocked refreshes are debounced to 1 second. Bag updates no longer rebuild the run tracker when no run is active.
 
 ---
 

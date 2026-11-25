@@ -5,46 +5,45 @@ local WR = WritRunner
 WR.Ledger = WR.Ledger or {}
 local L = WR.Ledger
 
--- All four Forever item IDs share the name "Coin Pouch". The amount of gold
--- inside depends on the writ tier, but the name is the same. 284584 is the
--- id listed on Forever Quest Log; 284583/284585/284586 are the other client
--- records (warcraftforever.wiki).
-local KNOWN_POUCHES = {
-  [284583] = true,
-  [284584] = true,
-  [284585] = true,
-  [284586] = true,
+-- Seeded Coin Pouch defaults. One table, easy to update when we bake in
+-- more averages later. All four Forever IDs share the name "Coin Pouch";
+-- the gold inside depends on the writ tier.
+--   284584 = Journeyman (ForeverDB / Forever Quest Log)
+--   284585 = Expert (ForeverDB: Moonsteel Broadsword and other Expert writs)
+--   284583 and 284586 have no published quest sources yet
+--   Artisan copper is the Wowhead Looter average (ConquestCapped ~75s agrees).
+-- Journeyman/Expert copper is left nil: published ranges conflict.
+-- itemID is nil until a database or a live open confirms it for that tier.
+local POUCH_DEFAULTS = {
+  Journeyman = { itemID = 284584, copper = nil,  source = nil },
+  Expert     = { itemID = 284585, copper = nil,  source = nil },
+  Artisan    = { itemID = nil,    copper = 7456, source = "Wowhead Looter average" },
 }
+local POUCH_TIER_ORDER = { "Journeyman", "Expert", "Artisan" }
+local KNOWN_POUCH_IDS = { 284583, 284584, 284585, 284586 }
+local KNOWN_POUCHES = {}
+do
+  local i
+  for i = 1, #KNOWN_POUCH_IDS do
+    KNOWN_POUCHES[KNOWN_POUCH_IDS[i]] = true
+  end
+end
 local POUCH_NAME = "Coin Pouch"
 local HISTORY_MAX = 10
 local WINDOW = 3
-
--- Pouch item ID -> writ tier, only where a database lists the quests.
--- 284584 is the Journeyman reward (ForeverDB / Forever Quest Log).
--- 284585 is the Expert reward (ForeverDB: Moonsteel Broadsword, etc.).
--- 284583 and 284586 have no published quest sources, so they are only
--- attributed via a turn-in that just happened.
-local POUCH_TIER = {
-  [284584] = "Journeyman",
-  [284585] = "Expert",
-}
-
--- Seeded defaults used only until the player has opened a pouch of that
--- tier. Artisan is the one average both Wowhead Looter (74.56s) and
--- ConquestCapped (~75s) agree on. Journeyman and Expert are not seeded:
--- published figures conflict (Wowhead Looter Journeyman 5–19s / Expert
--- avg 36s "may be higher"; ConquestCapped Journeyman 22–45s / Expert
--- 50–90s), and Darth has no pouch samples in SavedVariables yet.
-local POUCH_SEED = {
-  Artisan = { copper = 7456, source = "Wowhead Looter average" },
-}
+local MATCH_WINDOW = 8
+-- Money with no pouch-open is usually vendor/loot; only wait long enough
+-- for a bag-count drop that often arrives just after PLAYER_MONEY.
+local MONEY_WAIT = 2
+local SETTLE_DELAY = 0.3
 
 local lastMoney = 0
-local pouchWindowUntil = 0
 local pouchesAtArm = 0
-local pouchOpenedPending = 0
 local pendingTiers = {} -- FIFO of writ tiers waiting for a pouch to be opened
 local lastPouchCounts = {}
+local pendingOpens = {} -- FIFO { itemId, tier, t }
+local pendingMoney = {} -- FIFO { copper, t, source }
+local settleQueued = false
 local buyWindowUntil = 0
 local buyWindowDrop = 0
 local bagsSnap = {}
@@ -415,36 +414,218 @@ local function StatsDB()
   return WR.db.pouchStats
 end
 
+-- Migrate older {sum, n, last} records and fill a clean
+-- {tier, itemID, count, totalCopper, min, max} shape.
+function L.NormalizePouchStats()
+  local st = StatsDB()
+  if not st then
+    return
+  end
+  local tier, rec
+  for tier, rec in pairs(st) do
+    if type(rec) == "table" then
+      if rec.n and not rec.count then
+        rec.count = rec.n
+        rec.totalCopper = rec.sum or 0
+        rec.min = rec.min or rec.last
+        rec.max = rec.max or rec.last
+        rec.n, rec.sum, rec.last = nil, nil, nil
+      end
+      rec.tier = rec.tier or tier
+      if not rec.itemID and POUCH_DEFAULTS[tier] then
+        rec.itemID = POUCH_DEFAULTS[tier].itemID
+      end
+      rec.count = rec.count or 0
+      rec.totalCopper = rec.totalCopper or 0
+    end
+  end
+end
+
+-- itemID -> tier from defaults, then from learned stats.
+local function TierForPouchId(itemId)
+  if not itemId then
+    return nil
+  end
+  local t, rec
+  for t, rec in pairs(POUCH_DEFAULTS) do
+    if rec.itemID and rec.itemID == itemId then
+      return t
+    end
+  end
+  local st = WR.db and WR.db.pouchStats
+  if st then
+    for t, rec in pairs(st) do
+      if type(rec) == "table" and rec.itemID == itemId then
+        return rec.tier or t
+      end
+    end
+  end
+  return nil
+end
+
 -- Returns copper, source ("learned" or "seed"), sample count, source label.
 function L.ExpectedPouch(tier)
   if not tier then
     return nil
   end
+  L.NormalizePouchStats()
   local st = StatsDB()
   local rec = st and st[tier]
-  if rec and (rec.n or 0) > 0 and rec.sum then
-    return math.floor(rec.sum / rec.n + 0.5), "learned", rec.n, "your pouches"
+  if rec and (rec.count or 0) > 0 and rec.totalCopper then
+    return math.floor(rec.totalCopper / rec.count + 0.5), "learned", rec.count, "your pouches"
   end
-  local seed = POUCH_SEED[tier]
-  if seed then
+  local seed = POUCH_DEFAULTS[tier]
+  if seed and seed.copper then
     return seed.copper, "seed", 0, seed.source
   end
   return nil, nil, 0, nil
 end
 
-function L.RecordPouchSample(tier, copper)
-  if not tier or not copper or copper <= 0 then
+function L.RecordPouchSample(tier, copper, itemID)
+  if not copper or copper <= 0 then
+    return
+  end
+  if not tier then
+    tier = TierForPouchId(itemID)
+  end
+  if not tier then
     return
   end
   local st = StatsDB()
   if not st then
     return
   end
-  local rec = st[tier] or { sum = 0, n = 0 }
-  rec.sum = (rec.sum or 0) + copper
-  rec.n = (rec.n or 0) + 1
-  rec.last = copper
+  L.NormalizePouchStats()
+  local rec = st[tier]
+  if type(rec) ~= "table" then
+    rec = {
+      tier = tier,
+      itemID = itemID or (POUCH_DEFAULTS[tier] and POUCH_DEFAULTS[tier].itemID) or nil,
+      count = 0,
+      totalCopper = 0,
+      min = nil,
+      max = nil,
+    }
+  end
+  rec.tier = tier
+  rec.count = (rec.count or 0) + 1
+  rec.totalCopper = (rec.totalCopper or 0) + copper
+  if not rec.min or copper < rec.min then
+    rec.min = copper
+  end
+  if not rec.max or copper > rec.max then
+    rec.max = copper
+  end
+  if itemID then
+    rec.itemID = itemID
+  elseif not rec.itemID and POUCH_DEFAULTS[tier] then
+    rec.itemID = POUCH_DEFAULTS[tier].itemID
+  end
   st[tier] = rec
+end
+
+function L.GetPouchStats()
+  L.NormalizePouchStats()
+  return WR.db and WR.db.pouchStats or {}
+end
+
+function L.PouchDefaults()
+  return POUCH_DEFAULTS, POUCH_TIER_ORDER, KNOWN_POUCH_IDS
+end
+
+local function AvgCopper(rec)
+  if rec and (rec.count or 0) > 0 and rec.totalCopper then
+    return math.floor(rec.totalCopper / rec.count + 0.5)
+  end
+  return nil
+end
+
+-- Human-readable lines for /writs pouches.
+function L.PouchStatsLines()
+  L.NormalizePouchStats()
+  local st = WR.db and WR.db.pouchStats or {}
+  local lines, i = {}, 1
+  lines[#lines + 1] = "Coin Pouch averages (saved across runs):"
+  for i = 1, #POUCH_TIER_ORDER do
+    local tier = POUCH_TIER_ORDER[i]
+    local rec = st[tier]
+    local seed = POUCH_DEFAULTS[tier] or {}
+    local itemID = (rec and rec.itemID) or seed.itemID
+    local idTxt = itemID and ("item " .. tostring(itemID)) or "item ?"
+    if rec and (rec.count or 0) > 0 then
+      local avg = AvgCopper(rec)
+      local mm = ""
+      if rec.min and rec.max then
+        mm = string.format("  (min %s, max %s)", WR.MoneyText(rec.min), WR.MoneyText(rec.max))
+      end
+      lines[#lines + 1] = string.format("  %s  %s  n=%d  avg %s%s",
+        tier, idTxt, rec.count, WR.MoneyText(avg), mm)
+    elseif seed.copper then
+      lines[#lines + 1] = string.format("  %s  %s  no samples yet  ~%s seeded (%s)",
+        tier, idTxt, WR.MoneyText(seed.copper), seed.source or "seed")
+    else
+      lines[#lines + 1] = string.format("  %s  %s  no samples yet", tier, idTxt)
+    end
+  end
+  lines[#lines + 1] = "Known Coin Pouch item IDs: " .. table.concat(
+    (function()
+      local b, k = {}, 1
+      for k = 1, #KNOWN_POUCH_IDS do
+        b[k] = tostring(KNOWN_POUCH_IDS[k])
+      end
+      return b
+    end)(), ", ")
+  lines[#lines + 1] = "/writs pouches export  — copyable line for later defaults"
+  return lines
+end
+
+function L.PrintPouchStats()
+  local lines, i = L.PouchStatsLines()
+  for i = 1, #lines do
+    WR.Print(lines[i])
+  end
+end
+
+-- One copyable line: { {tier="Artisan",itemID=284583,count=4,totalCopper=29824,min=5005,max=7346}, ... }
+function L.PouchStatsExport()
+  L.NormalizePouchStats()
+  local st = WR.db and WR.db.pouchStats or {}
+  local parts, i = {}
+  for i = 1, #POUCH_TIER_ORDER do
+    local tier = POUCH_TIER_ORDER[i]
+    local rec = st[tier] or {}
+    local seed = POUCH_DEFAULTS[tier] or {}
+    local itemID = rec.itemID or seed.itemID
+    parts[#parts + 1] = string.format(
+      '{tier="%s",itemID=%s,count=%d,totalCopper=%d,min=%s,max=%s}',
+      tier,
+      itemID and tostring(itemID) or "nil",
+      rec.count or 0,
+      rec.totalCopper or 0,
+      rec.min and tostring(rec.min) or "nil",
+      rec.max and tostring(rec.max) or "nil")
+  end
+  return "WritRunnerPouchStats={" .. table.concat(parts, ",") .. "}"
+end
+
+function L.ExpectedPouchForSteps(steps)
+  local sum, known, missing, i = 0, 0, 0
+  for i = 1, #(steps or {}) do
+    local s = steps[i]
+    local tier = s.tier
+    if not tier then
+      local writ = s.questId and WR.Daily and WR.Daily.WritByQuestId and WR.Daily.WritByQuestId(s.questId)
+      tier = writ and writ.tier
+    end
+    local copper = tier and L.ExpectedPouch(tier)
+    if copper then
+      sum = sum + copper
+      known = known + 1
+    else
+      missing = missing + 1
+    end
+  end
+  return sum, known, missing
 end
 
 function L.NoteTurnInTier(tier)
@@ -467,64 +648,222 @@ local function PopPendingTier()
   return t
 end
 
-local function TierForPouchId(itemId)
-  return itemId and POUCH_TIER[itemId] or nil
+local function ConsumePendingTier(tier)
+  if not tier then
+    return PopPendingTier()
+  end
+  local p
+  for p = 1, #pendingTiers do
+    if pendingTiers[p] == tier then
+      table.remove(pendingTiers, p)
+      return tier
+    end
+  end
+  return tier
 end
 
-function L.AddPouchGold(copper, opened)
-  local run = RunDB()
-  if not run or not copper or copper <= 0 then
-    return
-  end
-  run.pouchGold = (run.pouchGold or 0) + copper
-  run.pouchOpened = (run.pouchOpened or 0) + (opened or 1)
-  -- Attribute this gold to a writ tier when we can: prefer the Coin Pouch
-  -- item id that just left the bags, else the most recent writ turn-in.
-  local openedN = opened or 1
-  if openedN < 1 then
-    openedN = 1
-  end
-  local per = math.floor(copper / openedN + 0.5)
-  local i
-  for i = 1, openedN do
-    local tier = nil
-    -- Which pouch id dropped since the last snapshot?
-    local id, counts
-    local _, nowCounts = L.PouchCount()
-    for id, was in pairs(lastPouchCounts) do
-      local now = nowCounts[id] or 0
-      if now < was then
-        tier = TierForPouchId(id)
-        break
-      end
-    end
-    if not tier then
-      tier = PopPendingTier()
-    else
-      -- Consume a matching pending turn-in if we have one.
-      local p
-      for p = 1, #pendingTiers do
-        if pendingTiers[p] == tier then
-          table.remove(pendingTiers, p)
-          break
-        end
-      end
-    end
-    if tier then
-      L.RecordPouchSample(tier, per)
-    end
-  end
-  lastPouchCounts = select(2, L.PouchCount())
+local function AfterPouchRecorded()
   if reminder and reminder:IsShown() then
     L.RefreshReminder()
   end
   if WR.Tracker and WR.Tracker.RefreshStats then
     WR.Tracker.RefreshStats()
   end
-  if WR.UI and WR.UI.Refresh and WR.UI.frame and WR.UI.frame:IsShown() then
-    -- Refresh so #3 net figures pick up a newly learned average.
-    -- Don't Rebuild the plan from prices; Refresh is fine.
+end
+
+-- Record one payout. `opens` is an optional list of {itemId, tier};
+-- otherwise `opened` is the count (gold is split across samples).
+function L.AddPouchGold(copper, opened, itemId, tier)
+  local run = RunDB()
+  if not copper or copper <= 0 then
+    return
   end
+  -- Still learn the average when no run is active (opened between runs).
+  local openedN = opened or 1
+  if openedN < 1 then
+    openedN = 1
+  end
+  if run then
+    run.pouchGold = (run.pouchGold or 0) + copper
+    run.pouchOpened = (run.pouchOpened or 0) + openedN
+  end
+  local per = math.floor(copper / openedN + 0.5)
+  local remainder = copper - per * (openedN - 1)
+  local i
+  for i = 1, openedN do
+    local id = itemId
+    local t = tier
+    if not t then
+      t = TierForPouchId(id)
+    end
+    t = ConsumePendingTier(t)
+    local sample = (i == openedN) and remainder or per
+    if t then
+      L.RecordPouchSample(t, sample, id)
+    end
+  end
+  lastPouchCounts = select(2, L.PouchCount())
+  AfterPouchRecorded()
+end
+
+function L.AddPouchGoldFromMatches(matches, combinedCopper)
+  -- matches: { { copper, itemId, tier }, ... }  or combinedCopper + opens
+  if combinedCopper and type(matches) == "table" then
+    local n, i, run = #matches
+    if n == 0 or combinedCopper <= 0 then
+      return
+    end
+    run = RunDB()
+    if run then
+      run.pouchGold = (run.pouchGold or 0) + combinedCopper
+      run.pouchOpened = (run.pouchOpened or 0) + n
+    end
+    local per = math.floor(combinedCopper / n + 0.5)
+    local remainder = combinedCopper - per * (n - 1)
+    for i = 1, n do
+      local o = matches[i]
+      local sample = (i == n) and remainder or per
+      local t = ConsumePendingTier(o.tier or TierForPouchId(o.itemId))
+      if t then
+        L.RecordPouchSample(t, sample, o.itemId)
+      end
+    end
+    lastPouchCounts = select(2, L.PouchCount())
+    AfterPouchRecorded()
+    return
+  end
+  local i
+  for i = 1, #(matches or {}) do
+    local m = matches[i]
+    L.AddPouchGold(m.copper, 1, m.itemId, m.tier)
+  end
+end
+
+local function ParseMoneyChat(msg)
+  if type(msg) ~= "string" then
+    return nil
+  end
+  local g = tonumber(msg:match("(%d+)%s+[Gg]old")) or 0
+  local s = tonumber(msg:match("(%d+)%s+[Ss]ilver")) or 0
+  local c = tonumber(msg:match("(%d+)%s+[Cc]opper")) or 0
+  if g == 0 and s == 0 and c == 0 then
+    return nil
+  end
+  if not (msg:find("[Rr]eceived") or msg:find("[Ll]oot") or msg:find("[Yy]ou receive")) then
+    return nil
+  end
+  return g * 10000 + s * 100 + c
+end
+
+local function PruneQueue(q, t, life)
+  life = life or MATCH_WINDOW
+  while q[1] and (t - (q[1].t or 0)) > life do
+    table.remove(q, 1)
+  end
+end
+
+local function QueueSettle()
+  if settleQueued then
+    return
+  end
+  settleQueued = true
+  After(SETTLE_DELAY, function()
+    settleQueued = false
+    if L.SettlePouchPending then
+      L.SettlePouchPending()
+    end
+  end)
+end
+
+function L.TryMatchPouches()
+  local t = (GetTime and GetTime()) or 0
+  PruneQueue(pendingOpens, t, MATCH_WINDOW)
+  PruneQueue(pendingMoney, t, MONEY_WAIT)
+  if #pendingOpens == 0 or #pendingMoney == 0 then
+    if #pendingOpens > 0 or #pendingMoney > 0 then
+      QueueSettle()
+    end
+    return
+  end
+  if #pendingOpens == #pendingMoney then
+    local matches, i = {}
+    for i = 1, #pendingOpens do
+      matches[i] = {
+        copper = pendingMoney[i].copper,
+        itemId = pendingOpens[i].itemId,
+        tier = pendingOpens[i].tier,
+      }
+    end
+    pendingOpens, pendingMoney = {}, {}
+    L.AddPouchGoldFromMatches(matches)
+    return
+  end
+  -- Unequal counts: wait a beat so a second "Received X" can arrive
+  -- instead of treating the first payout as the total for every open.
+  QueueSettle()
+end
+
+function L.SettlePouchPending()
+  local t = (GetTime and GetTime()) or 0
+  PruneQueue(pendingOpens, t, MATCH_WINDOW)
+  PruneQueue(pendingMoney, t, MONEY_WAIT)
+  if #pendingOpens > 0 and #pendingMoney == 1 then
+    -- Several pouches left the bags, one money event: combined payout.
+    local m = table.remove(pendingMoney, 1)
+    local opens = pendingOpens
+    pendingOpens = {}
+    L.AddPouchGoldFromMatches(opens, m.copper)
+    return
+  end
+  if #pendingOpens > 0 and #pendingMoney > 0 then
+    -- Pair what we can 1:1. Leftover opens wait for another money event;
+    -- leftover money stays until MATCH_WINDOW so a bag drop that is about
+    -- to land can still claim it (PLAYER_MONEY often fires first).
+    local n = math.min(#pendingOpens, #pendingMoney)
+    local matches, i = {}
+    for i = 1, n do
+      local o = table.remove(pendingOpens, 1)
+      local m = table.remove(pendingMoney, 1)
+      matches[i] = { copper = m.copper, itemId = o.itemId, tier = o.tier }
+    end
+    L.AddPouchGoldFromMatches(matches)
+    return
+  end
+  -- Opens with no money, or money with no open, stay queued until
+  -- PruneQueue drops them. Do not wipe money here: a bag-count drop
+  -- often arrives a moment after PLAYER_MONEY.
+end
+
+function L.NotePouchOpen(itemId, count, tier)
+  local n, i = count or 1
+  if n < 1 then
+    return
+  end
+  local t = (GetTime and GetTime()) or 0
+  if not tier then
+    tier = TierForPouchId(itemId)
+  end
+  for i = 1, n do
+    pendingOpens[#pendingOpens + 1] = { itemId = itemId, tier = tier, t = t }
+  end
+  L.TryMatchPouches()
+end
+
+function L.NotePouchMoney(copper, source)
+  if not copper or copper <= 0 then
+    return
+  end
+  local t = (GetTime and GetTime()) or 0
+  -- CHAT_MSG_MONEY and PLAYER_MONEY often fire for the same gain.
+  local i
+  for i = 1, #pendingMoney do
+    local p = pendingMoney[i]
+    if p.copper == copper and p.source ~= source and (t - (p.t or 0)) < 1.5 then
+      return
+    end
+  end
+  pendingMoney[#pendingMoney + 1] = { copper = copper, t = t, source = source or "money" }
+  L.TryMatchPouches()
 end
 
 function L.AddQuestGold(questId, copper)
@@ -647,6 +986,74 @@ local function MakeBtn(parent, text, w, onClick)
   return b
 end
 
+function L.ShowPouchExport()
+  local line = L.PouchStatsExport()
+  WR.Print(line)
+  if not CreateFrame then
+    return line
+  end
+  if not L._exportFrame then
+    local f = CreateFrame("Frame", "WritRunnerPouchExport", UIParent, "BackdropTemplate")
+    f:SetSize(520, 140)
+    f:SetPoint("CENTER")
+    f:SetFrameStrata("DIALOG")
+    pcall(function() f:SetToplevel(true) end)
+    f:SetMovable(true)
+    f:EnableMouse(true)
+    f:RegisterForDrag("LeftButton")
+    f:SetScript("OnDragStart", f.StartMoving)
+    f:SetScript("OnDragStop", f.StopMovingOrSizing)
+    f:SetClampedToScreen(true)
+    if Backdrop then
+      Backdrop(f)
+    elseif f.SetBackdrop then
+      pcall(f.SetBackdrop, f, {
+        bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+        edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+        tile = true, tileSize = 16, edgeSize = 12,
+        insets = { left = 3, right = 3, top = 3, bottom = 3 },
+      })
+      pcall(f.SetBackdropColor, f, 0, 0, 0, 0.9)
+    end
+    f.title = f:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+    f.title:SetPoint("TOP", 0, -12)
+    f.title:SetText("Pouch stats export")
+    f.hint = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    f.hint:SetPoint("TOP", f.title, "BOTTOM", 0, -4)
+    f.hint:SetText("Select all and copy (Ctrl+C).")
+    local box = CreateFrame("EditBox", nil, f)
+    box:SetPoint("TOPLEFT", 16, -48)
+    box:SetPoint("BOTTOMRIGHT", -16, 40)
+    box:SetAutoFocus(true)
+    box:SetMultiLine(true)
+    box:SetMaxLetters(4000)
+    box:SetFontObject(GameFontHighlightSmall or GameFontNormal)
+    if box.SetScript then
+      box:SetScript("OnEscapePressed", function() f:Hide() end)
+    end
+    f.box = box
+    local close = MakeBtn(f, "Close", 80, function() f:Hide() end)
+    close:SetPoint("BOTTOM", 0, 10)
+    if UISpecialFrames then
+      tinsert(UISpecialFrames, "WritRunnerPouchExport")
+    end
+    L._exportFrame = f
+  end
+  local f = L._exportFrame
+  if f.box and f.box.SetText then
+    f.box:SetText(line)
+    if f.box.HighlightText then
+      f.box:HighlightText()
+    end
+    if f.box.SetFocus then
+      f.box:SetFocus()
+    end
+  end
+  f:Show()
+  return line
+end
+
+
 function L.RefreshReminder()
   if not reminder or not reminder:IsShown() then
     return
@@ -735,6 +1142,12 @@ local function LinesForRecord(rec)
   end
   lines[#lines + 1] = "Gold from Coin Pouches:  " .. WR.MoneyText(rec.pouchGold or 0)
     .. (rec.pouchOpened and rec.pouchOpened > 0 and string.format("  (%d opened)", rec.pouchOpened) or "")
+  if rec.expectedPouch and rec.expectedPouch > 0 then
+    lines[#lines + 1] = "  Expected from averages:  ~" .. WR.MoneyText(rec.expectedPouch)
+      .. (rec.expectedMissing and rec.expectedMissing > 0
+        and string.format("  (%d tier%s still unknown)", rec.expectedMissing, rec.expectedMissing == 1 and "" or "s")
+        or "")
+  end
   if rec.unopened and rec.unopened > 0 then
     lines[#lines + 1] = Color(string.format("  %d unopened pouch%s still in bags (not counted).", rec.unopened, rec.unopened == 1 and "" or "es"), "ffd100")
   end
@@ -764,6 +1177,7 @@ function L.BuildRecord(reason)
   local pouchGold = run and run.pouchGold or 0
   local questGold = run and run.questGold or 0
   local unopened = L.PouchCount()
+  local expectedPouch, expectedKnown, expectedMissing = L.ExpectedPouchForSteps(steps)
   local rep = 0
   if run then
     if run.repAtStart and WR.Rep and WR.Rep.Value then
@@ -786,6 +1200,8 @@ function L.BuildRecord(reason)
     spendIncomplete = untracked > 0,
     pouchGold = pouchGold,
     pouchOpened = run and run.pouchOpened or 0,
+    expectedPouch = (expectedKnown or 0) > 0 and expectedPouch or nil,
+    expectedMissing = expectedMissing,
     questGold = questGold,
     net = pouchGold + questGold - spent,
     rep = rep > 0 and rep or nil,
@@ -1012,7 +1428,10 @@ end
 ev:SetScript("OnEvent", function(_, event, a1, a2, a3)
   if event == "PLAYER_LOGIN" then
     lastMoney = Money()
-    lastPouchCounts = select(2, L.PouchCount())
+    local n, counts = L.PouchCount()
+    pouchesAtArm = n
+    lastPouchCounts = counts
+    L.NormalizePouchStats()
     return
   end
   if event == "AUCTION_HOUSE_SHOW" then
@@ -1064,10 +1483,12 @@ ev:SetScript("OnEvent", function(_, event, a1, a2, a3)
     return
   end
   if event == "QUEST_TURNED_IN" then
-    -- Backup: core also calls L.OnQuestTurnedIn. Arm a pouch window in case
-    -- the pouch auto-opens or lands in bags this frame.
-    pouchesAtArm = L.PouchCount()
-    pouchWindowUntil = GetTime and (GetTime() + WINDOW) or WINDOW
+    -- Snapshot pouches so a bag drop after the reward lands is detected.
+    -- Do not arm a generic money window: that would count quest gold as
+    -- a pouch if PLAYER_MONEY arrives first.
+    local n, counts = L.PouchCount()
+    pouchesAtArm = n
+    lastPouchCounts = counts
     return
   end
   if event == "PLAYER_MONEY" then
@@ -1075,16 +1496,10 @@ ev:SetScript("OnEvent", function(_, event, a1, a2, a3)
     local delta = now - (lastMoney or now)
     lastMoney = now
     local t = GetTime and GetTime() or 0
-    if delta > 0 and pouchWindowUntil > 0 and t <= pouchWindowUntil then
-      local opened = pouchOpenedPending
-      if opened < 1 then
-        opened = 1
-      end
-      L.AddPouchGold(delta, opened)
-      pouchOpenedPending = 0
-      pouchesAtArm = L.PouchCount()
-      pouchWindowUntil = t + 1 -- brief tail for a second pouch
-      return
+    if delta > 0 then
+      L.NotePouchMoney(delta, "money")
+      -- Fall through? No: a pouch money gain should not also be treated
+      -- as an AH spend. Only look at losses for the buy window.
     end
     if delta < 0 and not BuyerPending() then
       local ah = (WR.Buyer and WR.Buyer.IsAHOpen and WR.Buyer.IsAHOpen())
@@ -1098,26 +1513,20 @@ ev:SetScript("OnEvent", function(_, event, a1, a2, a3)
     end
     return
   end
-  if event == "CHAT_MSG_MONEY" or event == "LOOT_OPENED" then
-    -- Only extend a window that was armed by a pouch leaving the bags.
-    -- Starting one here would count any loot gold as pouch gold.
-    if pouchWindowUntil > 0 then
-      pouchWindowUntil = GetTime and (GetTime() + WINDOW) or WINDOW
+  if event == "CHAT_MSG_MONEY" then
+    local copper = ParseMoneyChat(a1)
+    if copper and copper > 0 then
+      L.NotePouchMoney(copper, "chat")
     end
+    return
+  end
+  if event == "LOOT_OPENED" then
     return
   end
   if event == "LOOT_CLOSED" then
     return
   end
   if event == "BAG_UPDATE" or event == "BAG_UPDATE_DELAYED" then
-    -- Detect a pouch leaving bags even if we weren't armed (right-click open).
-    if event == "BAG_UPDATE" then
-      local n = L.PouchCount()
-      -- Cheap path: if reminder is up, always refresh after a delay.
-      if pouchWindowUntil == 0 then
-        -- We'll compare on delayed.
-      end
-    end
     if bagPending then
       return
     end
@@ -1130,22 +1539,24 @@ ev:SetScript("OnEvent", function(_, event, a1, a2, a3)
   end
 end)
 
--- If a pouch count drop happens without a prior arm (player opens one),
--- FlushBags only updates the reminder. Arm the money window there too.
+-- Compare bag snapshots and queue a pouch-open for every Coin Pouch
+-- that left the bags, even if PLAYER_MONEY already fired.
 local oldFlush = FlushBags
 FlushBags = function()
   local n, counts = L.PouchCount()
-  if pouchesAtArm == 0 and pouchOpenedPending == 0 then
+  if pouchesAtArm == 0 and #pendingOpens == 0 and not next(lastPouchCounts) then
     -- First look: remember the count, do not treat it as an open.
     pouchesAtArm = n
     lastPouchCounts = counts
-  elseif n < pouchesAtArm then
-    pouchOpenedPending = pouchOpenedPending + (pouchesAtArm - n)
-    pouchWindowUntil = GetTime and (GetTime() + WINDOW) or WINDOW
-    pouchesAtArm = n
-    -- Keep lastPouchCounts until the gold is attributed, so we still know
-    -- which pouch id left the bags.
   else
+    local id, was, now
+    for id, was in pairs(lastPouchCounts) do
+      now = counts[id] or 0
+      if now < was then
+        L.NotePouchOpen(id, was - now, TierForPouchId(id))
+      end
+    end
+    -- New pouch ids that were not in the last snapshot cannot be an open.
     pouchesAtArm = n
     lastPouchCounts = counts
   end
@@ -1160,5 +1571,16 @@ function L._Flush()
   FlushBags()
 end
 function L._PouchWindow()
-  return pouchWindowUntil, pouchesAtArm
+  -- Compatibility: a "window" is open while unmatched pouch opens are queued.
+  local t = (GetTime and GetTime()) or 0
+  if #pendingOpens > 0 then
+    return t + MATCH_WINDOW, pouchesAtArm
+  end
+  return 0, pouchesAtArm
+end
+function L._Pending()
+  return pendingOpens, pendingMoney
+end
+function L._Settle()
+  L.SettlePouchPending()
 end

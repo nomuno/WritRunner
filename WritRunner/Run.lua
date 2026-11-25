@@ -1276,11 +1276,16 @@ events:SetScript("OnEvent", function(_, event)
     bagPending = true
     local function flush()
       bagPending = nil
+      if not Run.IsActive() then
+        return
+      end
       Run.CheckBagFallback()
-      if WR.Tracker and WR.Tracker.Refresh then
-        WR.Tracker.Refresh()
-      elseif WR.Tracker and WR.Tracker.RefreshItem then
-        WR.Tracker.RefreshItem()
+      if WR.Tracker and WR.Tracker.IsShown and WR.Tracker.IsShown() then
+        if WR.Tracker.Refresh then
+          WR.Tracker.Refresh()
+        elseif WR.Tracker.RefreshItem then
+          WR.Tracker.RefreshItem()
+        end
       end
     end
     if C_Timer and C_Timer.After then

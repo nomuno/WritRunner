@@ -1,3 +1,18 @@
+# 1.3.8
+
+- **Apply limits honors the budget, even when the shopping list is locked.** A 5g budget no longer leaves an old 87-writ (144g+) plan in place. The lock still protects the list from Auctionator price updates while you shop, but a deliberate Apply limits (or Enter in the Budget / Max box) now asks to re-plan with the new limits, then rebuilds and relocks. Re-plan also reads the current boxes first, so the budget you just typed is the one it uses. "Limits applied" reports the plan that actually qualifies, not the frozen list.
+- **Less lag during an Auctionator scan.** With the window open and the plan locked, price-database updates only flip the #4 "prices changed" banner. They no longer re-rank every writ or rebuild the 87-stop route on each pulse (that was the hitch). Unlocked refreshes are debounced to 1 second. Bag updates no longer rebuild the run tracker when no run is active.
+
+# 1.3.7
+
+- **Coin Pouch totals accumulate.** Opening several pouches in a row (or after the last turn-in, before End run) now counts every one. Previously, gold often arrived in PLAYER_MONEY before the bag-count drop armed a 3-second window, so only a later pouch was recorded (for example 50s 5c from the last bag, and 73s 46c missed). Money gains and pouch-item IDs are matched one-for-one, in either order, and "Received X Silver" chat is used as a backup. Unopened pouches still in bags at End run are still flagged.
+- **Per-tier averages persist across runs** in SavedVariables as `{tier, itemID, count, totalCopper, min, max}`. Each open is attributed to a pouch item ID and writ tier when known (or the recent turn-in). #3 net estimates and the End run summary use the learned average, falling back to the seeded default (Artisan 74.56s) or "?" until there is data. Seeded defaults live in one table in Ledger.lua, easy to update later.
+- **/writs pouches** prints learned averages, counts, min/max, and item IDs. **/writs pouches export** prints a copyable `WritRunnerPouchStats={...}` line (and an edit box you can Ctrl+C).
+
+# 1.3.6
+
+- **Rep/g on owned writs.** Writs added from **Use writs in my bags** that cost nothing (you already have the writ and its fill item) no longer show a huge Rep/g number. The old sort sentinel looked like 1000000000.00 reputation per gold. The column is now blank, and the tooltip says "Already owned" instead of that figure. Those writs still sit at the top of the plan. If you still need to buy the fill item, Rep/g is the real ratio from that spend. The Net column and plan totals are unchanged and still use gold actually spent (no aggregate rep/g was being inflated).
+
 # 1.3.5
 
 - **Start run checks bags only.** If any writ or fill item is missing from your bags, the tracker does not start. The popup lists each missing item and where it is: in the bank, in the mailbox (last inbox scan, plus today's purchases not yet collected), or not owned, with a hint to visit the bank or mailbox and Start run again. Buttons are **Check again** and **Close**.
